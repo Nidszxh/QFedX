@@ -1,8 +1,8 @@
 import numpy as np
 import torch
 from Preprocess import preprocess_mnist
-from qAmplitude import amplitude_encode, get_statevector_from_circuit
-from qAngle import angle_encode
+from QFed.qAmplitude import amplitude_encode, get_statevector_from_circuit
+from QFed.qAngle import angle_encode
 import random
 import matplotlib.pyplot as plt
 
