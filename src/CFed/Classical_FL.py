@@ -5,6 +5,8 @@ import torch.optim as optim
 import torch.nn.functional as F
 import random
 from typing import List, Tuple, Dict
+import csv
+import matplotlib.pyplot as plt
 
 # Import preprocessing functions
 from Preprocess import preprocess_mnist
@@ -13,7 +15,8 @@ def set_seeds(seed=42):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 set_seeds(42)
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -39,13 +42,13 @@ class TinyCNN(nn.Module):
 
 def client_update(model_params: Dict, client_data: Tuple[torch.Tensor, torch.Tensor], 
                  epochs: int = 5, lr: float = 0.01, batch_size: int = 32) -> Tuple[Dict, int]:
-    # Train model locally and return updated parameters and sample count
     model = TinyCNN().to(device)
     model.load_state_dict(model_params)
     model.train()
     
     X_client, y_client = client_data
-    X_client, y_client = X_client.to(device), y_client.to(device)
+    X_client = torch.tensor(X_client, dtype=torch.float32).view(-1, 1, 28, 28).to(device)
+    y_client = torch.tensor(y_client, dtype=torch.long).to(device)
     
     dataset = torch.utils.data.TensorDataset(X_client, y_client)
     dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
@@ -76,15 +79,16 @@ def federated_averaging(client_updates: List[Tuple[Dict, int]]) -> Dict:
     for params, num_samples in client_updates:
         weight = num_samples / total_samples
         for key in aggregated_params.keys():
-            aggregated_params[key] += weight * params[key]
-    
+            aggregated_params[key] += weight * params[key].to(device)
+
     return aggregated_params
 
 def evaluate_model(model: nn.Module, test_data: Tuple[torch.Tensor, torch.Tensor]) -> float:
     # Evaluate model and return accuracy
     model.eval()
     X_test, y_test = test_data
-    X_test, y_test = X_test.to(device), y_test.to(device)
+    X_test = torch.tensor(X_test, dtype=torch.float32).view(-1, 1, 28, 28).to(device)
+    y_test = torch.tensor(y_test, dtype=torch.long).to(device)
     
     dataset = torch.utils.data.TensorDataset(X_test, y_test)
     dataloader = torch.utils.data.DataLoader(dataset, batch_size=256, shuffle=False)
@@ -108,8 +112,10 @@ def federated_learning(client_data: List[Tuple[torch.Tensor, torch.Tensor]],
                       learning_rate: float = 0.01,
                       batch_size: int = 32,
                       num_classes: int = 3) -> Dict:
-    # Main federated learning loop
+    import os
+    os.makedirs("artifacts", exist_ok=True)
 
+    # Initialize global model
     global_model = TinyCNN(num_classes=num_classes).to(device)
     
     # Track accuracy over rounds
@@ -126,9 +132,7 @@ def federated_learning(client_data: List[Tuple[torch.Tensor, torch.Tensor]],
     
     # Training loop
     for round_num in range(num_rounds):
-        # Collect client updates
         client_updates = []
-        
         for client_id in range(num_clients):
             params, num_samples = client_update(
                 global_model.state_dict(),
@@ -147,13 +151,34 @@ def federated_learning(client_data: List[Tuple[torch.Tensor, torch.Tensor]],
         test_acc = evaluate_model(global_model, test_data)
         test_accuracies.append(test_acc)
         
-        # Print progress
+        # Print progress every 5 rounds
         if (round_num + 1) % 5 == 0:
             print(f"Round {round_num + 1}: Test Accuracy = {test_acc:.4f}")
+
+    print(f"\nFinal Test Accuracy: {test_accuracies[-1]:.4f}")
+
+    # Save global model
+    torch.save(global_model.state_dict(), "artifacts/global_model.pt")
     
-    print("-" * 60)
-    print(f"Final Test Accuracy: {test_accuracies[-1]:.4f}")
-    
+    # Save per-round accuracies
+    with open("artifacts/round_accuracies.csv", "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["Round", "Accuracy"])
+        for i, acc in enumerate(test_accuracies):
+            writer.writerow([i, acc])
+
+    # Plot accuracy per round
+    plt.figure(figsize=(8,5))
+    plt.plot(range(len(test_accuracies)), test_accuracies, marker='o')
+    plt.xlabel("Round")
+    plt.ylabel("Accuracy")
+    plt.title("FedAvg Per-Round Accuracy")
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig("artifacts/fedavg_accuracy_plot.png", dpi=150)
+    print("FedAvg accuracy plot saved to artifacts/fedavg_accuracy_plot.png")
+    plt.show()
+
     return {'model': global_model, 'accuracies': test_accuracies}
 
 def main():
@@ -173,8 +198,7 @@ def main():
     }
     
     print("Classical Federated Learning on MNIST")
-    print("=" * 60)
-    
+  
     # Data preprocessing
     try:
         result = preprocess_mnist(
