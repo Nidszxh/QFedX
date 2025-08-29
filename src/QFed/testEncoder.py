@@ -1,6 +1,6 @@
 import numpy as np
 import torch
-from Preprocess import preprocess_mnist
+from data.Preprocess import preprocess_mnist
 from QFed.qAmplitude import amplitude_encode, get_statevector_from_circuit
 from QFed.qAngle import angle_encode
 import random
