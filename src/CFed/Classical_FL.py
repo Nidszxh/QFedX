@@ -9,7 +9,7 @@ import csv
 import matplotlib.pyplot as plt
 
 # Import preprocessing functions
-from Preprocess import preprocess_mnist
+from data.Preprocess import preprocess_mnist
 
 def set_seeds(seed=42):
     random.seed(seed)
