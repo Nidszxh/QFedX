@@ -44,7 +44,7 @@ def create_non_iid_partition(X_data, y_data, num_clients, alpha, rng):
     for idx, label in enumerate(y_data):
         class_indices[label].append(idx)
     
-    client_indices = [[] for _ in range(num_clients)]
+    client_indices = [np.zeros(len(y_data), dtype=int) for _ in range(num_clients)]
     
     for class_label in range(num_classes):
         class_data = np.array(class_indices[class_label])
@@ -67,7 +67,7 @@ def create_partition(X, y, num_clients, alpha=None, seed=42):
     rng = np.random.default_rng(seed)
     
     if alpha is None:
-        return create_iid_partition(X, y, num_clients, rng)
+        return create_iid_partition(X, y, num_clients, rng) 
     else:
         return create_non_iid_partition(X, y, num_clients, alpha, rng)
     
@@ -221,8 +221,8 @@ def preprocess_mnist(raw_folder: str, processed_folder: str, digits=(0,1,2),
     print(f"Filtering digits {digits} and normalizing...")
     train_mask = np.isin(y_train, digits)
     test_mask = np.isin(y_test, digits)
-    
-    # Keep original images (28, 28) for partitioning - this is the KEY FIX
+
+    # FIXED: Keeping original images (28, 28) for partitioning
     X_train_orig = X_train[train_mask].astype(np.float32) / 255.0
     y_train = y_train[train_mask]
     X_test_orig = X_test[test_mask].astype(np.float32) / 255.0  
@@ -297,12 +297,15 @@ def preprocess_mnist(raw_folder: str, processed_folder: str, digits=(0,1,2),
             X_client_flat = pca.transform(X_client_flat)
         
         X_client_flat = scaler.transform(X_client_flat)
-        client_data_processed.append((X_client_flat, y_client))
-        
-        # Save client data
-        torch.save((torch.tensor(X_client_flat, dtype=torch.float32), 
-                   torch.tensor(y_client, dtype=torch.long)), 
-                  Path(processed_folder) / f"client{i+1}.pt")
+
+        # --- NEW: convert to PyTorch tensors here so code can call .to(device) ---
+        X_client_tensor = torch.tensor(X_client_flat, dtype=torch.float32)
+        y_client_tensor = torch.tensor(y_client, dtype=torch.long)
+
+        client_data_processed.append((X_client_tensor, y_client_tensor))
+
+        torch.save((X_client_tensor, y_client_tensor),
+                   Path(processed_folder) / f"client{i+1}.pt")
 
     # Print statistics
     print(f"\nGlobal datasets saved to {processed_folder}")

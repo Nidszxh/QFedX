@@ -64,8 +64,9 @@ def client_update(model_params: Dict, client_data: Tuple[torch.Tensor, torch.Ten
     model.train()
     
     X_client, y_client = client_data
-    X_client = torch.tensor(X_client, dtype=torch.float32).view(-1, 1, 28, 28).to(device)
-    y_client = torch.tensor(y_client, dtype=torch.long).to(device)
+    X_client = X_client.to(dtype=torch.float32).view(-1, 1, 28, 28).to(device)
+    y_client = y_client.to(dtype=torch.long).to(device)
+
     
     dataset = torch.utils.data.TensorDataset(X_client, y_client)
     dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
@@ -122,9 +123,9 @@ def evaluate_model(model: nn.Module, test_data: Tuple[torch.Tensor, torch.Tensor
     # Enhanced evaluation that returns both accuracy and loss
     model.eval()
     X_test, y_test = test_data
-    X_test = torch.tensor(X_test, dtype=torch.float32).view(-1, 1, 28, 28).to(device)
-    y_test = torch.tensor(y_test, dtype=torch.long).to(device)
-    
+    X_test = X_test.to(dtype=torch.float32).view(-1, 1, 28, 28).to(device)
+    y_test = y_test.to(dtype=torch.long).to(device)
+
     dataset = torch.utils.data.TensorDataset(X_test, y_test)
     dataloader = torch.utils.data.DataLoader(dataset, batch_size=256, shuffle=False)
     
@@ -211,9 +212,9 @@ def federated_learning(client_data: List[Tuple[torch.Tensor, torch.Tensor]],
                 batch_size=batch_size
             )
             client_updates.append((params, num_samples, training_loss))
-        
+
         # Aggregate updates
-        aggregated_params, avg_train_loss = federated_averaging(client_updates)
+        aggregated_params, avg_train_loss = federated_averaging(client_updates, device, global_model.state_dict())
         global_model.load_state_dict(aggregated_params)
         
         # Evaluate
@@ -263,7 +264,7 @@ def federated_learning(client_data: List[Tuple[torch.Tensor, torch.Tensor]],
     plt.tight_layout()
     plt.savefig("artifacts/enhanced_fedavg_metrics.png", dpi=150)
     print("Enhanced metrics plot saved to artifacts/enhanced_fedavg_metrics.png")
-    plt.show()
+    plt.close(fig)
 
     return {
         'model': global_model, 
