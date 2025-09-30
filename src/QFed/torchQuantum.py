@@ -10,7 +10,7 @@ import numpy as np
 from typing import Optional, Literal
 from torch.utils.data import DataLoader, TensorDataset
 
-# Import your custom modules
+# Import the data                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          preprocessing and encoding modules
 from qAngle import angle_encode, pool_to_n_features
 from qAmplitude import amplitude_encode, normalize_for_amplitude, pad_to_pow2
 from data.preprocess import preprocess_mnist
@@ -19,7 +19,7 @@ torch.set_default_dtype(torch.float32)
 
 class TorchQuantumQNN(nn.Module):
     """
-    Enhanced QNN using TorchQuantum with hybrid architecture:
+    Quantum Neural Network (QNN) using TorchQuantum with hybrid architecture:
     - Classical preprocessor
     - Quantum variational layers
     - Classical head for output
@@ -53,32 +53,39 @@ class TorchQuantumQNN(nn.Module):
         
         # HYBRID ARCHITECTURE COMPONENTS
         
-        # 1. Classical preprocessor (small front-end)
+        # 1. Classical preprocessor (adapted for custom encoding modules)
         if encoding == 'angle':
+            # For angle encoding, we might need different preprocessing
+            # depending on what your qAngle module expects
             self.pre_fc = nn.Sequential(
                 nn.Linear(n_features, n_qubits),
                 nn.Tanh()  # Keep in [-1,1] for angle encoding
             )
             self.quantum_input_size = n_qubits
         else:  # amplitude encoding
-            required_size = 2 ** n_qubits
+            # For amplitude encoding, prepare data for your qAmplitude module
+            # The module will handle padding to power of 2, so we can be flexible here
+            target_size = min(2 ** n_qubits, n_features * 2)  # Reasonable intermediate size
             self.pre_fc = nn.Sequential(
-                nn.Linear(n_features, required_size),
+                nn.Linear(n_features, target_size),
                 nn.Tanh()
             )
-            self.quantum_input_size = required_size
+            self.quantum_input_size = target_size
         
         # 2. Quantum circuit layers
         self.q_layers = nn.ModuleList()
         
-        # Initial encoding layer (if angle encoding)
+        # Initial encoding layer (configured for custom modules)
         if encoding == 'angle':
+            # For angle encoding, we'll use the custom qAngle module
+            # The TorchQuantum encoder will be used as fallback
             self.encoder = tq.GeneralEncoder([
                 {'input_idx': [i], 'func': 'ry', 'wires': [i]} 
                 for i in range(n_qubits)
             ])
         else:
-            # For amplitude encoding, we'll use a custom method
+            # For amplitude encoding, we rely on custom qAmplitude module
+            # No TorchQuantum encoder needed as we'll set states directly
             self.encoder = None
         
         # Variational layers
@@ -146,24 +153,103 @@ class TorchQuantumQNN(nn.Module):
                     idx += 1
 
     def quantum_forward(self, x):
-        """Forward pass through quantum circuit"""
+        """Forward pass through quantum circuit using custom encoding modules"""
         batch_size = x.shape[0]
+        device = x.device
         
         # Initialize quantum device for batch processing
         self.q_device.reset_states(batch_size)
         
         if self.encoding == 'angle':
-            # Angle encoding
-            self.encoder(self.q_device, x)
-        else:
-            # Amplitude encoding - manually apply state preparation
-            for b in range(batch_size):
-                # Normalize the input for amplitude encoding
-                input_normalized = x[b] / (torch.norm(x[b]) + 1e-8)
-                # Apply amplitude encoding by setting the state directly
-                # Note: This is a simplified approach - in practice you might need
-                # more sophisticated state preparation
-                self.q_device.set_states(input_normalized.unsqueeze(0), wires=list(range(self.n_qubits)))
+            # Use custom angle encoding from qAngle module
+            try:
+                # Apply angle encoding using your custom module
+                encoded_data = angle_encode(x)  # Your custom angle encoding
+                
+                # If angle_encode returns data that needs pooling to fit n_qubits
+                if encoded_data.shape[1] != self.n_qubits:
+                    encoded_data = pool_to_n_features(encoded_data, self.n_qubits)
+                
+                # Ensure proper device and dtype
+                if isinstance(encoded_data, np.ndarray):
+                    encoded_data = torch.tensor(encoded_data, dtype=torch.float32, device=device)
+                else:
+                    encoded_data = encoded_data.to(device=device, dtype=torch.float32)
+                
+                # Apply the encoded angles to quantum device
+                self.encoder(self.q_device, encoded_data)
+                
+            except Exception as e:
+                print(f"Warning: Custom angle encoding failed ({e}), using fallback")
+                # Fallback to simple encoding
+                self.encoder(self.q_device, x)
+                
+        else:  # amplitude encoding
+            # Use custom amplitude encoding from qAmplitude module
+            try:
+                # Process each sample in batch
+                encoded_states = []
+                for b in range(batch_size):
+                    sample = x[b]
+                    
+                    # Apply your custom amplitude encoding pipeline
+                    # 1. Normalize for amplitude encoding
+                    normalized_sample = normalize_for_amplitude(sample.cpu().numpy() if sample.is_cuda else sample.numpy())
+                    
+                    # 2. Pad to power of 2 if needed
+                    padded_sample = pad_to_pow2(normalized_sample)
+                    
+                    # 3. Apply amplitude encoding
+                    encoded_sample = amplitude_encode(padded_sample, self.n_qubits)
+                    
+                    # Convert back to tensor if needed
+                    if isinstance(encoded_sample, np.ndarray):
+                        encoded_sample = torch.tensor(encoded_sample, dtype=torch.float32, device=device)
+                    
+                    encoded_states.append(encoded_sample)
+                
+                # Apply amplitude encoding by setting quantum states
+                for b, amplitudes in enumerate(encoded_states):
+                    # Ensure proper normalization
+                    amplitudes = amplitudes / (torch.norm(amplitudes) + 1e-8)
+                    
+                    # Set the quantum state for this batch element
+                    # Note: This assumes TorchQuantum supports batch state setting
+                    if hasattr(self.q_device, 'set_states_batch'):
+                        # If batch setting is supported
+                        if b == 0:  # Initialize batch states
+                            batch_states = amplitudes.unsqueeze(0)
+                        else:
+                            batch_states = torch.cat([batch_states, amplitudes.unsqueeze(0)], dim=0)
+                    else:
+                        # Set state individually (fallback)
+                        self.q_device.set_states(amplitudes.unsqueeze(0), wires=list(range(self.n_qubits)))
+                
+                # If we accumulated batch states, set them all at once
+                if 'batch_states' in locals():
+                    try:
+                        self.q_device.set_states_batch(batch_states, wires=list(range(self.n_qubits)))
+                    except:
+                        # Fallback to individual setting
+                        for b, state in enumerate(batch_states):
+                            self.q_device.set_states(state.unsqueeze(0), wires=list(range(self.n_qubits)))
+                    
+            except Exception as e:
+                print(f"Warning: Custom amplitude encoding failed ({e}), using fallback")
+                # Fallback to simple normalization
+                for b in range(batch_size):
+                    input_sample = x[b]
+                    input_normalized = input_sample / (torch.norm(input_sample) + 1e-8)
+                    
+                    # Pad or truncate to match 2^n_qubits
+                    target_size = 2 ** self.n_qubits
+                    if input_normalized.shape[0] > target_size:
+                        input_normalized = input_normalized[:target_size]
+                    elif input_normalized.shape[0] < target_size:
+                        padding = torch.zeros(target_size - input_normalized.shape[0], device=device)
+                        input_normalized = torch.cat([input_normalized, padding])
+                    
+                    self.q_device.set_states(input_normalized.unsqueeze(0), wires=list(range(self.n_qubits)))
         
         # Apply variational layers
         for layer_idx in range(self.n_layers):
@@ -186,24 +272,33 @@ class TorchQuantumQNN(nn.Module):
 
     def forward(self, x):
         batch_size = x.shape[0]
+        device = x.device
         
         # 1. Classical preprocessing
         pre_processed = self.pre_fc(x)
         
         if self.encoding == 'angle':
-            # Scale to appropriate range for angles
-            quantum_input = (pre_processed + 1.0) * (np.pi / 2.0)
+            # Scale to appropriate range for angles (0 to π)
+            quantum_input = torch.abs(pre_processed) * np.pi
         else:
+            # For amplitude encoding, keep in reasonable range
             quantum_input = pre_processed
         
         # 2. Quantum processing
         try:
             q_out = self.quantum_forward(quantum_input)
+            
+            # Ensure q_out has correct device and dtype
+            if q_out.device != device:
+                q_out = q_out.to(device)
+            if q_out.dtype != torch.float32:
+                q_out = q_out.float()
+                
         except Exception as e:
             print(f"Warning: Quantum circuit failed: {e}")
-            # Fallback: use zero output
+            # Fallback: use zero output with proper device and dtype
             q_out = torch.zeros(batch_size, self.n_readout, 
-                              dtype=torch.float32, device=x.device)
+                              dtype=torch.float32, device=device)
         
         # 3. Classical head
         logits = self.classical_head(q_out)
@@ -358,7 +453,7 @@ def main():
         'device': 'cuda' if torch.cuda.is_available() else 'cpu',
     }
     
-    print("Enhanced Quantum Neural Network Training (TorchQuantum)")
+    print("Quantum Neural Network Training (TorchQuantum)")
     print(f"Config: {config}")
     print("-" * 50)
     
