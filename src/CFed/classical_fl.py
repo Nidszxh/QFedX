@@ -1,3 +1,7 @@
+import sys
+from pathlib import Path
+sys.path.append(str(Path(__file__).resolve().parent.parent))  
+
 import os
 import numpy as np
 import torch
@@ -23,7 +27,7 @@ set_seeds(42)
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 class TinyCNN(nn.Module):
-    # Enhanced CNN with Batch Normalization for better training stability
+    # eCNN with Batch Normalization for better training stability
     def __init__(self, num_classes=3):
         super(TinyCNN, self).__init__()
         # Convolutional layers with batch normalization
@@ -60,8 +64,9 @@ def client_update(model_params: Dict, client_data: Tuple[torch.Tensor, torch.Ten
     model.train()
     
     X_client, y_client = client_data
-    X_client = torch.tensor(X_client, dtype=torch.float32).view(-1, 1, 28, 28).to(device)
-    y_client = torch.tensor(y_client, dtype=torch.long).to(device)
+    X_client = X_client.to(dtype=torch.float32).view(-1, 1, 28, 28).to(device)
+    y_client = y_client.to(dtype=torch.long).to(device)
+
     
     dataset = torch.utils.data.TensorDataset(X_client, y_client)
     dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
@@ -84,22 +89,33 @@ def client_update(model_params: Dict, client_data: Tuple[torch.Tensor, torch.Ten
     avg_training_loss = np.mean(epoch_losses)
     return model.state_dict(), len(X_client), avg_training_loss
 
-def federated_averaging(client_updates: List[Tuple[Dict, int, float]]) -> Tuple[Dict, float]:
-    # Enhanced federated averaging that also computes weighted average training loss
+def federated_averaging(client_updates, device, global_params_template):
+    if len(client_updates) == 0:
+        raise ValueError("No client updates to aggregate")
+
     total_samples = sum(num_samples for _, num_samples, _ in client_updates)
-    
+    if total_samples == 0:
+        raise ValueError("Total number of samples is zero")
+
     aggregated_params = {}
-    first_params = client_updates[0][0]
-    
-    for key in first_params.keys():
-        aggregated_params[key] = torch.zeros_like(first_params[key])
-    
+    for key, tensor in global_params_template.items():
+        if tensor.dtype == torch.long:  
+            # counters like BatchNorm.num_batches_tracked
+            aggregated_params[key] = tensor.clone().to(device)
+        else:
+            aggregated_params[key] = torch.zeros_like(tensor, dtype=torch.float32, device=device)
+
     weighted_loss = 0.0
     for params, num_samples, training_loss in client_updates:
         weight = num_samples / total_samples
         weighted_loss += weight * training_loss
         for key in aggregated_params.keys():
-            aggregated_params[key] += weight * params[key].to(device)
+            client_tensor = params[key].to(device)
+            if aggregated_params[key].dtype == torch.long:
+                # just copy (don’t try to average)
+                aggregated_params[key] = client_tensor.clone()
+            else:
+                aggregated_params[key] += client_tensor.float() * weight
 
     return aggregated_params, weighted_loss
 
@@ -107,9 +123,9 @@ def evaluate_model(model: nn.Module, test_data: Tuple[torch.Tensor, torch.Tensor
     # Enhanced evaluation that returns both accuracy and loss
     model.eval()
     X_test, y_test = test_data
-    X_test = torch.tensor(X_test, dtype=torch.float32).view(-1, 1, 28, 28).to(device)
-    y_test = torch.tensor(y_test, dtype=torch.long).to(device)
-    
+    X_test = X_test.to(dtype=torch.float32).view(-1, 1, 28, 28).to(device)
+    y_test = y_test.to(dtype=torch.long).to(device)
+
     dataset = torch.utils.data.TensorDataset(X_test, y_test)
     dataloader = torch.utils.data.DataLoader(dataset, batch_size=256, shuffle=False)
     
@@ -196,9 +212,9 @@ def federated_learning(client_data: List[Tuple[torch.Tensor, torch.Tensor]],
                 batch_size=batch_size
             )
             client_updates.append((params, num_samples, training_loss))
-        
+
         # Aggregate updates
-        aggregated_params, avg_train_loss = federated_averaging(client_updates)
+        aggregated_params, avg_train_loss = federated_averaging(client_updates, device, global_model.state_dict())
         global_model.load_state_dict(aggregated_params)
         
         # Evaluate
@@ -248,7 +264,7 @@ def federated_learning(client_data: List[Tuple[torch.Tensor, torch.Tensor]],
     plt.tight_layout()
     plt.savefig("artifacts/enhanced_fedavg_metrics.png", dpi=150)
     print("Enhanced metrics plot saved to artifacts/enhanced_fedavg_metrics.png")
-    plt.show()
+    plt.close(fig)
 
     return {
         'model': global_model, 
