@@ -2,361 +2,416 @@ import numpy as np
 import torch
 import random
 import matplotlib.pyplot as plt
-from pathlib import Path
-from collections import defaultdict
-from sklearn.model_selection import train_test_split
-from sklearn.decomposition import PCA
-from sklearn.preprocessing import MinMaxScaler
-import joblib
+
 import json
+import joblib
+from pathlib import Path
+from typing import Tuple, List, Optional, Union
+
+from sklearn.model_selection import train_test_split
+from sklearn.decomposition import PCA, IncrementalPCA
+from sklearn.preprocessing import MinMaxScaler
 
 def read_idx_images(filename: str) -> np.ndarray:
+    """Memory-efficient IDX image reader with proper header parsing."""
     with open(filename, 'rb') as f:
-        f.read(16)  
-        return np.frombuffer(f.read(), dtype=np.uint8).reshape(-1, 28, 28)
+        magic, num_images, rows, cols = np.frombuffer(f.read(16), dtype='>i4')
+        if magic != 2051:
+            raise ValueError(f"Invalid magic number {magic} for image file")
+        data = np.frombuffer(f.read(), dtype=np.uint8)
+    return data.reshape(num_images, rows, cols)
 
 def read_idx_labels(filename: str) -> np.ndarray:
+    """Memory-efficient IDX label reader with proper header parsing."""
     with open(filename, 'rb') as f:
-        f.read(8)  
-        return np.frombuffer(f.read(), dtype=np.uint8)
+        magic, num_labels = np.frombuffer(f.read(8), dtype='>i4')
+        if magic != 2049:
+            raise ValueError(f"Invalid magic number {magic} for label file")
+        data = np.frombuffer(f.read(), dtype=np.uint8)
+    return data
 
-def create_iid_partition(X_data, y_data, num_clients, rng):
-    # Create IID partition of data across clients.
-    indices = np.arange(len(X_data))
+# Partitioning Logic (IID and Non-IID via Dirichlet)
+def create_iid_partition(indices: np.ndarray, num_clients: int, rng: np.random.Generator) -> List[np.ndarray]:
+    """Create IID partition using indices (zero-copy until final assignment)."""
     rng.shuffle(indices)
-    
-    num_items = len(X_data) // num_clients
-    client_data = []
-    
-    for i in range(num_clients):
-        start_idx = i * num_items
-        end_idx = len(X_data) if i == num_clients - 1 else (i + 1) * num_items
-        client_indices = indices[start_idx:end_idx]
-        client_data.append((X_data[client_indices], y_data[client_indices]))
-    
-    return client_data
+    return np.array_split(indices, num_clients)  # Cleaner than manual slicing
 
-def create_non_iid_partition(X_data, y_data, num_clients, alpha, rng):
-    # Create non-IID partition using Dirichlet distribution.
+def create_non_iid_partition(y_data: np.ndarray, num_clients: int, alpha: float, rng: np.random.Generator) -> List[np.ndarray]:
+    """Optimized non-IID partition using Dirichlet distribution."""
     num_classes = len(np.unique(y_data))
+    label_indices = [np.where(y_data == i)[0] for i in range(num_classes)]
+    client_indices = [[] for _ in range(num_clients)]
     
-    class_indices = defaultdict(list)
-    for idx, label in enumerate(y_data):
-        class_indices[label].append(idx)
-    
-    client_indices = [np.zeros(len(y_data), dtype=int) for _ in range(num_clients)]
-    
-    for class_label in range(num_classes):
-        class_data = np.array(class_indices[class_label])
-        rng.shuffle(class_data)
-        
+    for indices in label_indices:
+        rng.shuffle(indices)
         proportions = rng.dirichlet([alpha] * num_clients)
+        splits = np.insert(np.cumsum(proportions), 0, 0) * len(indices)
+        splits = np.round(splits).astype(int)
+        splits[-1] = len(indices)  # Guarantee all samples used
         
-        start_idx = 0
-        for client_id in range(num_clients):
-            end_idx = start_idx + int(len(class_data) * proportions[client_id])
-            if client_id == num_clients - 1:
-                end_idx = len(class_data)
-            client_indices[client_id].extend(class_data[start_idx:end_idx])
-            start_idx = end_idx
+        for cid in range(num_clients):
+            client_indices[cid].extend(indices[splits[cid]:splits[cid+1]])
     
-    return [(X_data[indices], y_data[indices]) for indices in client_indices]
+    return [np.array(idx, dtype=np.int64) for idx in client_indices]
 
-def create_partition(X, y, num_clients, alpha=None, seed=42):
-    # Unified partition API with proper RNG handling.
+def create_partition(y_data: np.ndarray, num_clients: int, alpha: Optional[float] = None, seed: int = 42) -> List[np.ndarray]:
+    """Unified partition API: IID if alpha=None, else Dirichlet non-IID."""
     rng = np.random.default_rng(seed)
+    indices = np.arange(len(y_data))
     
-    if alpha is None:
-        return create_iid_partition(X, y, num_clients, rng) 
-    else:
-        return create_non_iid_partition(X, y, num_clients, alpha, rng)
-    
-def visualize_client_data(client_data, save_path=None, samples_per_client=5, is_pca=False):
-    # Visualize client data with proper handling for both PCA and image data
+    return (create_iid_partition(indices, num_clients, rng) if alpha is None 
+            else create_non_iid_partition(y_data, num_clients, alpha, rng))
+
+# Visualization Functions
+def visualize_client_data(client_data: List[Tuple], save_path: Optional[str] = None, 
+                          samples_per_client: int = 5, is_pca: bool = False):
+    """Visualize client data: PCA scatter or image grid."""
     num_clients = len(client_data)
     max_clients_plot = min(num_clients, 8)
     
     if is_pca:
-        # Scatter plot for PCA features
         fig, axes = plt.subplots(1, max_clients_plot, figsize=(max_clients_plot * 4, 4))
-        
-        # Handle single client case properly
-        if max_clients_plot == 1:
-            axes = [axes]
+        axes = np.atleast_1d(axes)
 
         for i in range(max_clients_plot):
             X, y = client_data[i]
             ax = axes[i]
             if X.shape[1] >= 2:
                 scatter = ax.scatter(X[:, 0], X[:, 1], c=y, cmap='tab10', s=10, alpha=0.7)
-                ax.set_title(f"Client {i+1} PCA Features")
+                ax.set_title(f"Client {i+1} PCA")
                 ax.set_xlabel("PC1")
                 ax.set_ylabel("PC2")
                 plt.colorbar(scatter, ax=ax)
             else:
-                ax.text(0.5, 0.5, "PCA Dim < 2", ha='center', va='center')
+                ax.text(0.5, 0.5, "Insufficient PCA dims", ha='center', va='center', fontsize=10)
                 ax.set_title(f"Client {i+1}")
                 ax.axis('off')
 
-        plt.suptitle(f"PCA Features Distribution (showing {max_clients_plot}/{num_clients} clients)", fontsize=14)
-        plt.tight_layout()
-
+        plt.suptitle(f"PCA Feature Distribution ({max_clients_plot}/{num_clients} clients)", fontsize=14)
+    
     else:
-        # Original MNIST image visualization
         fig, axes = plt.subplots(max_clients_plot, samples_per_client, 
-                               figsize=(samples_per_client * 2, max_clients_plot * 2))
-
-        # Critical fix: properly handle axes for different cases
-        axes = np.atleast_2d(axes)
-        if axes.shape[0] == 1 and max_clients_plot > 1:
-            axes = axes.T  # Transpose if needed
-        elif max_clients_plot == 1 and samples_per_client == 1:
-            axes = axes.reshape(1, 1)
-        elif max_clients_plot == 1:
-            axes = axes.reshape(1, -1)
+                                figsize=(samples_per_client * 2, max_clients_plot * 2))
+        axes = np.atleast_2d(axes).reshape(max_clients_plot, samples_per_client)
 
         for i in range(max_clients_plot):
             X, y = client_data[i]
             for j in range(samples_per_client):
                 ax = axes[i, j]
                 if j < len(X):
-                    # Handle different input shapes properly
-                    image = X[j]
-                    if image.ndim == 1:  # Flattened
-                        image = image.reshape(28, 28)
-                    elif image.ndim == 3 and image.shape[0] == 1:  # (1, 28, 28)
-                        image = image[0]
-                    # else assume it's already (28, 28)
-                    
-                    ax.imshow(image, cmap='gray')
-                    ax.set_xticks([])
-                    ax.set_yticks([])
+                    img = X[j].reshape(28, 28) if X[j].ndim == 1 else X[j].squeeze()
+                    ax.imshow(img, cmap='gray')
                     ax.set_title(f"Label: {y[j]}", fontsize=8)
+                    ax.axis('off')
                 else:
                     ax.axis('off')
                     
-            # Add client label to first column
-            axes[i, 0].set_ylabel(f"Client {i+1}", fontsize=10)
+            axes[i, 0].set_ylabel(f"Client {i+1}", fontsize=10, rotation=0, labelpad=30)
 
-        plt.suptitle(f"Sample Images from Clients (showing {max_clients_plot}/{num_clients})", fontsize=14)
-        plt.tight_layout()
+        plt.suptitle(f"Sample Images ({max_clients_plot}/{num_clients} clients)", fontsize=14)
 
+    plt.tight_layout()
     if save_path:
         Path(save_path).parent.mkdir(parents=True, exist_ok=True)
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        print(f"Visualization saved to {save_path}")
+        print(f"📊 Visualization saved: {save_path}")
     plt.close(fig)
 
-def plot_class_distribution(client_data, save_path="./results/class_distribution.png"):
+def plot_class_distribution(client_data: List[Tuple], save_path: str = "./results/class_distribution.png"):
+    """Plot stacked bar chart of class distribution across clients."""
     Path(save_path).parent.mkdir(parents=True, exist_ok=True)
     
-    all_classes = set()
-    for _, y_client in client_data:
-        all_classes.update(y_client)
-    classes = sorted(all_classes)
+    all_classes = sorted(set().union(*[set(y.tolist() if isinstance(y, torch.Tensor) else y) 
+                                        for _, y in client_data]))
     
     distributions = []
     for _, y_client in client_data:
-        unique, counts = np.unique(y_client, return_counts=True)
-        dist = {class_id: 0 for class_id in classes}
-        for class_id, count in zip(unique, counts):
-            dist[class_id] = count
-        distributions.append([dist[c] for c in classes])
+        y_np = y_client.numpy() if isinstance(y_client, torch.Tensor) else y_client
+        counts = {cls: 0 for cls in all_classes}
+        unique, class_counts = np.unique(y_np, return_counts=True)
+        counts.update(dict(zip(unique, class_counts)))
+        distributions.append([counts[c] for c in all_classes])
     
     distributions = np.array(distributions).T
-    client_names = [f'Client {i+1}' for i in range(len(client_data))]
-    colors = plt.cm.Set3(np.linspace(0, 1, len(classes)))
+    colors = plt.cm.Set3(np.linspace(0, 1, len(all_classes)))
     
     fig, ax = plt.subplots(figsize=(10, 6))
     bottom = np.zeros(len(client_data))
     
-    for i, class_id in enumerate(classes):
-        ax.bar(client_names, distributions[i], bottom=bottom, 
-               label=f'Digit {class_id}', color=colors[i], alpha=0.8)
+    for i, cls in enumerate(all_classes):
+        ax.bar(range(len(client_data)), distributions[i], bottom=bottom, 
+               label=f'Digit {cls}', color=colors[i], alpha=0.85)
         bottom += distributions[i]
     
-    ax.set_xlabel('Clients')
-    ax.set_ylabel('Number of Samples')
-    ax.set_title('Class Distribution Across Clients')
-    ax.legend()
+    ax.set_xticks(range(len(client_data)))
+    ax.set_xticklabels([f'Client {i+1}' for i in range(len(client_data))])
+    ax.set_xlabel('Clients', fontsize=11)
+    ax.set_ylabel('Sample Count', fontsize=11)
+    ax.set_title('Class Distribution Across Clients', fontsize=13, fontweight='bold')
+    ax.legend(loc='upper right')
+    ax.grid(axis='y', alpha=0.3, linestyle='--')
+    
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close(fig)
-    print(f"Class distribution plot saved to {save_path}")
+    print(f"📊 Class distribution plot saved: {save_path}")
 
-def preprocess_mnist(raw_folder: str, processed_folder: str, digits=(0,1,2), 
-                     val_split=0.1, num_clients=4, partition_type='iid', alpha=0.5,
-                     apply_pca=False, pca_components=4, seed=42):
-
-    # Set random seeds consistently  
+# Main Preprocessing Pipeline
+def preprocess_mnist(
+    raw_folder: str,
+    processed_folder: str,
+    digits: Tuple[int, ...] = (0, 1, 2),
+    val_split: float = 0.1,
+    num_clients: int = 4,
+    partition_type: str = 'iid',
+    alpha: float = 0.5,
+    apply_pca: bool = False,
+    pca_components: int = 4,
+    seed: int = 42,
+    generate_plots: bool = True,
+    use_incremental_pca: bool = False,
+    pca_batch_size: int = 1000
+) -> Tuple:
+    """
+    Quantum Federated Learning MNIST preprocessing pipeline.
+    
+    Optimizations:
+    - Index-based partitioning (no data copying until final step)
+    - Transform once, slice many (batch processing for clients)
+    - Optional incremental PCA for memory efficiency
+    - Lazy visualization generation
+    
+    Args:
+        raw_folder: Path to raw MNIST IDX files
+        processed_folder: Output path for processed data
+        digits: Tuple of digit classes to include
+        val_split: Validation set fraction
+        num_clients: Number of federated clients
+        partition_type: 'iid' or 'non_iid'
+        alpha: Dirichlet concentration (lower = more non-IID)
+        apply_pca: Whether to apply PCA dimensionality reduction
+        pca_components: Number of PCA components
+        seed: Random seed for reproducibility
+        generate_plots: Enable visualization generation
+        use_incremental_pca: Use IncrementalPCA for large datasets
+        pca_batch_size: Batch size for incremental PCA
+    
+    Returns:
+        (train_data, val_data, test_data, client_data_list)
+    """
+    
+    # Reproducibility
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
     
-    # Create directories
-    Path(processed_folder).mkdir(parents=True, exist_ok=True)
-    Path("./results").mkdir(parents=True, exist_ok=True)
-    Path("./artifacts").mkdir(parents=True, exist_ok=True)
-        
+    # Directory setup
+    for path in [processed_folder, "./results", "./artifacts"]:
+        Path(path).mkdir(parents=True, exist_ok=True)
+    
+    # 1. Load Raw Data    
+    print("\nQuantum Federated Learning - MNIST Preprocessing")
+    
     try:
-        files = {
+        file_map = {
             'train_images': "train-images.idx3-ubyte",
-            'train_labels': "train-labels.idx1-ubyte", 
+            'train_labels': "train-labels.idx1-ubyte",
             'test_images': "t10k-images.idx3-ubyte",
             'test_labels': "t10k-labels.idx1-ubyte"
         }
         
-        X_train = read_idx_images(Path(raw_folder) / files['train_images'])
-        y_train = read_idx_labels(Path(raw_folder) / files['train_labels'])
-        X_test = read_idx_images(Path(raw_folder) / files['test_images'])
-        y_test = read_idx_labels(Path(raw_folder) / files['test_labels'])
+        X_train = read_idx_images(Path(raw_folder) / file_map['train_images'])
+        y_train = read_idx_labels(Path(raw_folder) / file_map['train_labels'])
+        X_test = read_idx_images(Path(raw_folder) / file_map['test_images'])
+        y_test = read_idx_labels(Path(raw_folder) / file_map['test_labels'])
         
         print(f"\nRaw data loaded: Train {X_train.shape}, Test {X_test.shape}")
+        
     except (FileNotFoundError, ValueError) as e:
         print(f"Error loading raw data: {e}")
         return None
     
-    print(f"Filtering digits {digits} and normalizing...")
+    # 2. Filter Digits  
+    print(f"\n🔍 Filtering digits {digits}...")
     train_mask = np.isin(y_train, digits)
     test_mask = np.isin(y_test, digits)
-
-    # FIXED: Keeping original images (28, 28) for partitioning
-    X_train_orig = X_train[train_mask].astype(np.float32) / 255.0
-    y_train = y_train[train_mask]
-    X_test_orig = X_test[test_mask].astype(np.float32) / 255.0  
-    y_test = y_test[test_mask]
     
-    print(f"After filtering: Train {X_train_orig.shape}, Test {X_test_orig.shape}")
+    X_train_filt = X_train[train_mask]
+    y_train_filt = y_train[train_mask]
+    X_test_filt = X_test[test_mask]
+    y_test_filt = y_test[test_mask]
     
-    # CRITICAL: Partition on original images (not flattened) for visualization
-    print(f"\nCreating {partition_type} partition across {num_clients} clients...")
-    client_data_orig = create_partition(
-        X_train_orig, y_train, num_clients, 
+    print(f"   After filtering: Train {X_train_filt.shape}, Test {X_test_filt.shape}")
+    
+    # 3. Create Partitions 
+    print(f"\n📊 Creating {partition_type.upper()} partition for {num_clients} clients...")
+    client_indices = create_partition(
+        y_train_filt, num_clients,
         alpha if partition_type == 'non_iid' else None, seed
     )
     
-    print("Client data distribution (original images):")
-    for i, (X_client, y_client) in enumerate(client_data_orig):
-        unique, counts = np.unique(y_client, return_counts=True)
-        dist_str = ", ".join([f"Digit {u}: {c}" for u, c in zip(unique, counts)])
-        print(f"  Client {i+1}: {X_client.shape} ({dist_str})")
-
-    # Now process for quantum ML pipeline (flatten → PCA → scale)
-    X_train_flat = X_train_orig.reshape(len(X_train_orig), -1)
-    X_test_flat = X_test_orig.reshape(len(X_test_orig), -1)
-
-    # Create validation split
-    X_train_flat, X_val_flat, y_train_split, y_val = train_test_split(
-        X_train_flat, y_train, test_size=val_split, stratify=y_train, random_state=seed
+    # Validate partitions
+    for i, idx in enumerate(client_indices):
+        if len(idx) == 0:
+            raise ValueError(f"❌ Client {i+1} received no data!")
+        if len(np.unique(y_train_filt[idx])) == 1:
+            print(f"⚠️  Warning: Client {i+1} has only one class")
+    
+    print("\n   Client data distribution:")
+    for i, idx in enumerate(client_indices):
+        y_cli = y_train_filt[idx]
+        unique, counts = np.unique(y_cli, return_counts=True)
+        dist = ", ".join([f"Digit {u}: {c}" for u, c in zip(unique, counts)])
+        print(f"     Client {i+1}: {len(idx):>5} samples  [{dist}]")
+    
+    # 4. Train/Val Split (Before Transformation)  
+    print(f"\n✂️  Splitting train/val ({1-val_split:.0%}/{val_split:.0%})...")
+    train_idx, val_idx = train_test_split(
+        np.arange(len(y_train_filt)),
+        test_size=val_split,
+        stratify=y_train_filt,
+        random_state=seed
     )
-
-    # Validate PCA components
+    
+    X_train_split = X_train_filt[train_idx]
+    y_train_split = y_train_filt[train_idx]
+    X_val_split = X_train_filt[val_idx]
+    y_val = y_train_filt[val_idx]
+    
+    # 5. Normalize and Flatten  
+    print("\n🔢 Normalizing and flattening to [0,1]...")
+    X_train_flat = (X_train_split / 255.0).astype(np.float32).reshape(len(X_train_split), -1)
+    X_val_flat = (X_val_split / 255.0).astype(np.float32).reshape(len(X_val_split), -1)
+    X_test_flat = (X_test_filt / 255.0).astype(np.float32).reshape(len(X_test_filt), -1)
+    
+    # 6. Apply PCA (Optional) 
     if apply_pca:
         if pca_components > X_train_flat.shape[1]:
-            raise ValueError(f"PCA components ({pca_components}) cannot exceed feature dimensions ({X_train_flat.shape[1]})")
+            raise ValueError(f"PCA components ({pca_components}) > features ({X_train_flat.shape[1]})")
         
-        print(f"\nApplying PCA: {X_train_flat.shape[1]} → {pca_components} components for quantum qubits")
-        pca = PCA(n_components=pca_components)
-        X_train_flat = pca.fit_transform(X_train_flat)
+        print(f"\n🧬 Applying PCA: {X_train_flat.shape[1]}D → {pca_components}D")
+        
+        if use_incremental_pca and len(X_train_flat) > 10000:
+            print(f"   Using Incremental PCA (batch_size={pca_batch_size})")
+            pca = IncrementalPCA(n_components=pca_components, batch_size=pca_batch_size)
+            for i in range(0, len(X_train_flat), pca_batch_size):
+                pca.partial_fit(X_train_flat[i:i+pca_batch_size])
+        else:
+            pca = PCA(n_components=pca_components)
+            pca.fit(X_train_flat)
+        
+        X_train_flat = pca.transform(X_train_flat)
         X_val_flat = pca.transform(X_val_flat)
         X_test_flat = pca.transform(X_test_flat)
         
-        joblib.dump(pca, Path("./artifacts") / "pca_k.pkl")
-        print(f"PCA model saved (explained variance ratio: {pca.explained_variance_ratio_})")
-
-    # Scale for quantum encoding
-    print("\nApplying MinMax scaling to [-1, 1] for quantum encoding...")
+        joblib.dump(pca, Path("./artifacts") / "pca_model.pkl")
+        print(f"   Explained variance: {pca.explained_variance_ratio_.sum():.4f}")
+    
+    # 7. Scale to [-1, 1] (Quantum Encoding Range)
+    print("\n  Scaling to [-1, 1] for quantum encoding...")
     scaler = MinMaxScaler(feature_range=(-1, 1))
     X_train_flat = scaler.fit_transform(X_train_flat)
     X_val_flat = scaler.transform(X_val_flat)
     X_test_flat = scaler.transform(X_test_flat)
     
     joblib.dump(scaler, Path("./artifacts") / "scaler.pkl")
-
-    # Save global datasets
+    
+    # 8. Save Global Datasets
+    print(f"\n💾 Saving global datasets to {processed_folder}...")
     datasets = {
-        'train': (torch.tensor(X_train_flat, dtype=torch.float32), torch.tensor(y_train_split, dtype=torch.long)),
-        'val': (torch.tensor(X_val_flat, dtype=torch.float32), torch.tensor(y_val, dtype=torch.long)),
-        'test': (torch.tensor(X_test_flat, dtype=torch.float32), torch.tensor(y_test, dtype=torch.long))
+        'train': (torch.tensor(X_train_flat, dtype=torch.float32),
+                  torch.tensor(y_train_split, dtype=torch.long)),
+        'val': (torch.tensor(X_val_flat, dtype=torch.float32),
+                torch.tensor(y_val, dtype=torch.long)),
+        'test': (torch.tensor(X_test_flat, dtype=torch.float32),
+                 torch.tensor(y_test_filt, dtype=torch.long))
     }
-
+    
     for name, data in datasets.items():
         torch.save(data, Path(processed_folder) / f"{name}.pt")
-
-    # Process client partitions with same transformations
+    
+    # 9. Process Client Data (Transform Once, Slice Many)
+    print("\n🌐 Processing client partitions...")
+    
+    # Transform ALL filtered training data once
+    X_all_norm = (X_train_filt / 255.0).astype(np.float32).reshape(len(X_train_filt), -1)
+    if apply_pca:
+        X_all_norm = pca.transform(X_all_norm)
+    X_all_norm = scaler.transform(X_all_norm)
+    
+    # Slice for each client
     client_data_processed = []
-    print("\nProcessing client partitions with PCA/scaling...")
+    client_data_orig = []
     
-    for i, (X_client_orig, y_client) in enumerate(client_data_orig):
-        # Apply same pipeline: flatten → PCA → scale
-        X_client_flat = X_client_orig.reshape(len(X_client_orig), -1)
+    for i, idx in enumerate(client_indices):
+        X_cli = torch.tensor(X_all_norm[idx], dtype=torch.float32)
+        y_cli = torch.tensor(y_train_filt[idx], dtype=torch.long)
         
-        if apply_pca:
-            X_client_flat = pca.transform(X_client_flat)
+        client_data_processed.append((X_cli, y_cli))
+        torch.save((X_cli, y_cli), Path(processed_folder) / f"client{i+1}.pt")
         
-        X_client_flat = scaler.transform(X_client_flat)
-
-        # --- NEW: convert to PyTorch tensors here so code can call .to(device) ---
-        X_client_tensor = torch.tensor(X_client_flat, dtype=torch.float32)
-        y_client_tensor = torch.tensor(y_client, dtype=torch.long)
-
-        client_data_processed.append((X_client_tensor, y_client_tensor))
-
-        torch.save((X_client_tensor, y_client_tensor),
-                   Path(processed_folder) / f"client{i+1}.pt")
-
-    # Print statistics
-    print(f"\nGlobal datasets saved to {processed_folder}")
-    splits_data = [("Train", y_train_split), ("Val", y_val), ("Test", y_test)]
-    print("Global class distribution:")
-    for split_name, y_split in splits_data:
-        unique, counts = np.unique(y_split, return_counts=True)
-        dist_str = ", ".join([f"Digit {u}: {c}" for u, c in zip(unique, counts)])
-        print(f"  {split_name}: {dist_str}")
-
-    # Generate visualizations
-    print("\nGenerating visualizations...")
+        # For visualization (original images)
+        X_cli_orig = (X_train_filt[idx] / 255.0).astype(np.float32)
+        client_data_orig.append((X_cli_orig, y_train_filt[idx]))
+        print(f"   Client {i+1}: {X_cli.shape}, Labels: {len(torch.unique(y_cli))} classes")
+        
+    # 10. Print Statistics
+    print("\n📈 Global class distribution:")
+    for name, labels in [("Train", y_train_split), ("Val", y_val), ("Test", y_test_filt)]:
+        unique, counts = np.unique(labels, return_counts=True)
+        dist = ", ".join([f"Digit {u}: {c}" for u, c in zip(unique, counts)])
+        print(f"   {name:>5}: {dist}")
     
-    # Always visualize original images (meaningful)
-    visualize_client_data(
-        client_data_orig,
-        save_path=Path("results") / "client_data_images.png",
-        is_pca=False  # FIXED: Use False for original images
-    )
-    
-    # Visualize PCA features only if PCA was applied and has enough dimensions
-    if apply_pca and pca_components >= 2:
+    # 11. Generate Visualizations    
+    if generate_plots:
+        print("\n📊 Generating visualizations...")
+        
         visualize_client_data(
-            client_data_processed,
-            save_path=Path("results") / "client_data_pca.png", 
-            is_pca=apply_pca  # FIXED: Use the actual boolean, not a condition
+            client_data_orig,
+            save_path="./results/client_data_images.png",
+            is_pca=False
         )
-
-    plot_class_distribution(client_data_orig)
+        
+        if apply_pca and pca_components >= 2:
+            visualize_client_data(
+                client_data_processed,
+                save_path="./results/client_data_pca.png",
+                is_pca=True
+            )
+        
+        plot_class_distribution(client_data_orig)
     
-    # Save metadata
+    # 12. Save Metadata   
+    
     metadata = {
-        'digits': digits,
+        'digits': list(digits),
         'num_clients': num_clients,
         'partition_type': partition_type,
         'alpha': alpha if partition_type == 'non_iid' else None,
         'apply_pca': apply_pca,
         'pca_components': pca_components if apply_pca else None,
+        'use_incremental_pca': use_incremental_pca if apply_pca else None,
         'val_split': val_split,
         'seed': seed,
-        'feature_dim_final': X_train_flat.shape[1],
-        'total_samples': {'train': len(y_train_split), 'val': len(y_val), 'test': len(y_test)}
+        'feature_dim': X_train_flat.shape[1],
+        'samples': {
+            'train': len(y_train_split),
+            'val': len(y_val),
+            'test': len(y_test_filt)
+        }
     }
     
-    with open(Path("artifacts") / "preprocessing_metadata.json", 'w') as f:
+    with open(Path("./artifacts") / "preprocessing_metadata.json", 'w') as f:
         json.dump(metadata, f, indent=2)
     
-    print(f"\nQuantum FL preprocessing completed!")
-    print(f"Original: 784D → Final: {X_train_flat.shape[1]}D ({'PCA+Scaling' if apply_pca else 'Scaling only'})")
-    print(f"Files saved in: {processed_folder}")
-    print(f"Artifacts saved in: ./artifacts/")
+    print("\nQuantum FL Preprocessing Complete!")
+    print("\n""📋 Summary:")
+    print(f"   Dimensionality: 784D → {X_train_flat.shape[1]}D")
+    print(f"   Method: {'PCA + MinMax Scaling' if apply_pca else 'MinMax Scaling Only'}")
+    print(f"   Processed data: {processed_folder}")
+    print(f"   Artifacts: ./artifacts/")
     
     return datasets['train'], datasets['val'], datasets['test'], client_data_processed
 
@@ -367,9 +422,12 @@ if __name__ == "__main__":
         digits=(0, 1, 2),
         val_split=0.1,
         num_clients=4,
-        partition_type='iid',  # or 'non_iid'
-        alpha=0.5,         # Lower values = more non-IID (e.g., 0.1)
-        apply_pca=True,   
-        pca_components=4,  # Number of qubits for feature encoding
-        seed=42
+        partition_type='iid',  # 'iid' or 'non_iid'
+        alpha=0.5,             # Lower = more non-IID (e.g., 0.1)
+        apply_pca=True,
+        pca_components=4,
+        seed=42,
+        generate_plots=True,   # Disable for HPC batch jobs
+        use_incremental_pca=False,
+        pca_batch_size=1000
     )
