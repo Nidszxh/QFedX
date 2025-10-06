@@ -9,7 +9,7 @@ import pennylane as qml
 
 # Add parent folder to sys.path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from data.Preprocess import preprocess_mnist 
+from deprecated.Preprocess import preprocess_mnist 
 
 # QNN parameters
 n_qubits = 4

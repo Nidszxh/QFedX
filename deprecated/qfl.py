@@ -14,8 +14,8 @@ import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader, TensorDataset
 
 # Import your existing modules
-from QFed.hybridqnn import EnhancedQNN, train_enhanced_qnn, evaluate_model as evaluate_qnn_model
-from CFed.classical_fl import federated_averaging, set_seeds, evaluate_model as evaluate_classical_model
+from deprecated.hybridqnn import EnhancedQNN, train_enhanced_qnn, evaluate_model as evaluate_qnn_model
+from deprecated.classical_fl import federated_averaging, set_seeds, evaluate_model as evaluate_classical_model
 from data.preprocess import preprocess_mnist
 
 def set_qfl_seeds(seed=42):
