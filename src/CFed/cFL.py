@@ -15,6 +15,14 @@ from typing import List, Tuple, Dict, Optional
 
 from data.preprocess import preprocess_mnist
 
+# Import visualization utilities
+try:
+    from viz_cFL import generate_all_cfl_visualizations
+    VISUALIZATIONS_AVAILABLE = True
+except ImportError:
+    print("⚠️  Warning: viz_cFL.py not found. Visualizations will be skipped.")
+    VISUALIZATIONS_AVAILABLE = False
+
 # Configuration and Device Setup
 def set_seeds(seed: int = 42):
     random.seed(seed)
@@ -157,7 +165,6 @@ def evaluate_model(model: nn.Module, test_data: Tuple[torch.Tensor, torch.Tensor
     return correct / total, np.mean(losses)
 
 # Client Pool Manager (Optimization)
-
 class ClientPool:
     """Manages pre-instantiated client models to avoid repeated allocation."""
     def __init__(self, num_clients: int, num_classes: int = 3):
@@ -167,11 +174,10 @@ class ClientPool:
         return self.clients[client_id]
 
 # Main Federated Learning Training Loop
-
 def federated_learning(client_data: List[Tuple[torch.Tensor, torch.Tensor]], test_data: Tuple[torch.Tensor, torch.Tensor],
                         num_rounds: int = 30, local_epochs: int = 5, learning_rate: float = 0.01,
                         batch_size: int = 32, num_classes: int = 3, client_fraction: float = 1.0,
-                        save_dir: str = "./artifacts") -> Dict:
+                        save_dir: str = "./artifacts", config: Dict = None) -> Dict:
     """
     Run federated learning with FedAvg algorithm.
     
@@ -185,6 +191,7 @@ def federated_learning(client_data: List[Tuple[torch.Tensor, torch.Tensor]], tes
         num_classes: Number of output classes
         client_fraction: Fraction of clients to sample per round
         save_dir: Directory for saving artifacts
+        config: Configuration dictionary for visualization
     
     Returns:
         Dictionary with model and training metrics
@@ -198,13 +205,16 @@ def federated_learning(client_data: List[Tuple[torch.Tensor, torch.Tensor]], tes
     
     # Metrics tracking
     test_accuracies, test_losses, train_losses = [], [], []
+    client_losses_per_round = []  # Track per-client losses for visualization
     
+    print("\n" + "="*70)
     print("Federated Learning Training")
+    print("="*70)
     print(f"   Total clients: {num_clients}")
     print(f"   Participation rate: {client_fraction:.0%}")
     print(f"   Rounds: {num_rounds}")
     print(f"   Local epochs: {local_epochs}")
-    print(f"   Learning rate: {learning_rate}"+ "\n")
+    print(f"   Learning rate: {learning_rate}\n")
     
     # Initial evaluation
     init_acc, init_loss = evaluate_model(global_model, test_data)
@@ -221,6 +231,8 @@ def federated_learning(client_data: List[Tuple[torch.Tensor, torch.Tensor]], tes
         
         # Client updates
         client_updates = []
+        round_client_losses = [0.0] * num_clients  # Initialize losses for all clients
+        
         for cid in selected:
             params, n_samples, loss = client_update(
                 global_model.state_dict(),
@@ -230,6 +242,10 @@ def federated_learning(client_data: List[Tuple[torch.Tensor, torch.Tensor]], tes
                 batch_size=batch_size
             )
             client_updates.append((params, n_samples, loss))
+            round_client_losses[cid] = loss
+        
+        # Store client losses for this round
+        client_losses_per_round.append([round_client_losses[cid] for cid in selected])
         
         # Aggregate
         aggregated, avg_train_loss = federated_averaging(
@@ -251,9 +267,13 @@ def federated_learning(client_data: List[Tuple[torch.Tensor, torch.Tensor]], tes
                   f"Train Loss = {avg_train_loss:.4f}")
     
     # Final results
-    print("\nTraining Complete!")
+    print("\n" + "="*70)
+    print("✅ Training Complete!")
+    print("="*70)
     print(f"   Final Test Accuracy: {test_accuracies[-1]:.4f}")
     print(f"   Final Test Loss: {test_losses[-1]:.4f}")
+    print(f"   Best Test Accuracy: {max(test_accuracies):.4f} (Round {np.argmax(test_accuracies)})")
+    print("="*70 + "\n")
 
     # Save artifacts
     torch.save(global_model.state_dict(), Path(save_dir) / "global_model.pt")
@@ -267,7 +287,7 @@ def federated_learning(client_data: List[Tuple[torch.Tensor, torch.Tensor]], tes
             writer.writerow([i, f"{acc:.6f}", f"{tl:.6f}", f"{tr:.6f}"])
     print(f"📊 Metrics saved: {save_dir}/metrics.csv")
     
-    # Plot metrics
+    # Plot basic metrics (original)
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
     
     rounds = list(range(len(test_accuracies)))
@@ -295,14 +315,40 @@ def federated_learning(client_data: List[Tuple[torch.Tensor, torch.Tensor]], tes
     plot_path = Path(save_dir) / "fedavg_metrics.png"
     plt.savefig(plot_path, dpi=150, bbox_inches='tight')
     plt.close(fig)
-    print(f"📈 Plots saved: {plot_path}\n")
+    print(f"📈 Basic plots saved: {plot_path}")
     
-    return {
+    # Prepare metrics dictionary
+    metrics = {
         'model': global_model,
         'test_accuracies': test_accuracies,
         'test_losses': test_losses,
-        'train_losses': train_losses
+        'train_losses': train_losses,
+        'client_losses_per_round': client_losses_per_round
     }
+    
+    # Generate advanced visualizations
+    if VISUALIZATIONS_AVAILABLE:
+        try:
+            # Prepare class names
+            class_names = [f"Digit {d}" for d in config.get('digits', range(num_classes))] if config else None
+            
+            generate_all_cfl_visualizations(
+                metrics=metrics,
+                config=config if config else {},
+                client_data=client_data,
+                test_data=test_data,
+                global_model=global_model,
+                device=device,
+                client_losses_per_round=client_losses_per_round,
+                class_names=class_names,
+                save_dir="./results/cfl"
+            )
+        except Exception as e:
+            print(f"\n⚠️  Warning: Could not generate advanced visualizations: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    return metrics
 
 def main():
     """Main entry point for classical federated learning."""
@@ -322,10 +368,13 @@ def main():
         'save_dir': './artifacts'
     }
     
-    print("\nClassical Federated Learning on MNIST")
-    print("Configuration:")
+    print("\n" + "="*70)
+    print("Classical Federated Learning on MNIST")
+    print("="*70)
+    print("\n📋 Configuration:")
     for k, v in config.items():
         print(f"  {k:20s}: {v}")
+    print()
     
     # Preprocessing
     try:
@@ -337,20 +386,20 @@ def main():
             num_clients=config['num_clients'],
             partition_type=config['partition_type'],
             alpha=config['alpha'],
-            generate_plots=True  # Disable for cleaner output
+            generate_plots=False  # Disable preprocessing plots for cleaner output
         )
         
         if result is None:
-            print(" Data preprocessing failed. Check MNIST files in raw folder.")
+            print("❌ Data preprocessing failed. Check MNIST files in raw folder.")
             print("   Expected: train-images.idx3-ubyte, train-labels.idx1-ubyte,")
             print("            t10k-images.idx3-ubyte, t10k-labels.idx1-ubyte")
             return
         
         train_data, val_data, test_data, client_data = result
-        print(f"Data loaded: {len(client_data)} clients, {len(test_data[1])} test samples\n")
+        print(f"✅ Data loaded: {len(client_data)} clients, {len(test_data[1])} test samples\n")
         
     except Exception as e:
-        print(f" Preprocessing error: {e}")
+        print(f"❌ Preprocessing error: {e}")
         return
     
     # Run federated learning
@@ -364,13 +413,14 @@ def main():
             batch_size=config['batch_size'],
             num_classes=len(config['digits']),
             client_fraction=config['client_fraction'],
-            save_dir=config['save_dir']
+            save_dir=config['save_dir'],
+            config=config  # Pass config for visualization
         )
         
-        print(f"Final accuracy: {results['test_accuracies'][-1]:.4f}\n")
+        print(f"\n🎉 Final accuracy: {results['test_accuracies'][-1]:.4f}\n")
         
     except Exception as e:
-        print(f" Training error: {e}")
+        print(f"❌ Training error: {e}")
         import traceback
         traceback.print_exc()
         return

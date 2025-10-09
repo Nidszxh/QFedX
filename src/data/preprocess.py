@@ -12,6 +12,14 @@ from sklearn.model_selection import train_test_split
 from sklearn.decomposition import PCA, IncrementalPCA
 from sklearn.preprocessing import MinMaxScaler
 
+# Import visualization utilities
+try:
+    from viz_preprocess import generate_all_preprocessing_visualizations
+    VISUALIZATIONS_AVAILABLE = True
+except ImportError:
+    print("⚠️  Warning: viz_preprocess.py not found. Visualizations will be skipped.")
+    VISUALIZATIONS_AVAILABLE = False
+
 def read_idx_images(filename: str) -> np.ndarray:
     """Memory-efficient IDX image reader with proper header parsing."""
     with open(filename, 'rb') as f:
@@ -175,12 +183,6 @@ def preprocess_mnist(
     """
     Quantum Federated Learning MNIST preprocessing pipeline.
     
-    Optimizations:
-    - Index-based partitioning (no data copying until final step)
-    - Transform once, slice many (batch processing for clients)
-    - Optional incremental PCA for memory efficiency
-    - Lazy visualization generation
-    
     Args:
         raw_folder: Path to raw MNIST IDX files
         processed_folder: Output path for processed data
@@ -212,7 +214,9 @@ def preprocess_mnist(
         Path(path).mkdir(parents=True, exist_ok=True)
     
     # 1. Load Raw Data    
-    print("\nQuantum Federated Learning - MNIST Preprocessing")
+    print("\n" + "="*70)
+    print("Quantum Federated Learning - MNIST Preprocessing")
+    print("="*70)
     
     try:
         file_map = {
@@ -227,10 +231,10 @@ def preprocess_mnist(
         X_test = read_idx_images(Path(raw_folder) / file_map['test_images'])
         y_test = read_idx_labels(Path(raw_folder) / file_map['test_labels'])
         
-        print(f"\nRaw data loaded: Train {X_train.shape}, Test {X_test.shape}")
+        print(f"\n✅ Raw data loaded: Train {X_train.shape}, Test {X_test.shape}")
         
     except (FileNotFoundError, ValueError) as e:
-        print(f"Error loading raw data: {e}")
+        print(f"❌ Error loading raw data: {e}")
         return None
     
     # 2. Filter Digits  
@@ -286,7 +290,11 @@ def preprocess_mnist(
     X_val_flat = (X_val_split / 255.0).astype(np.float32).reshape(len(X_val_split), -1)
     X_test_flat = (X_test_filt / 255.0).astype(np.float32).reshape(len(X_test_filt), -1)
     
+    # Store data before scaling for visualization
+    data_before_scaling = X_train_flat.copy()
+    
     # 6. Apply PCA (Optional) 
+    pca_model = None
     if apply_pca:
         if pca_components > X_train_flat.shape[1]:
             raise ValueError(f"PCA components ({pca_components}) > features ({X_train_flat.shape[1]})")
@@ -295,28 +303,34 @@ def preprocess_mnist(
         
         if use_incremental_pca and len(X_train_flat) > 10000:
             print(f"   Using Incremental PCA (batch_size={pca_batch_size})")
-            pca = IncrementalPCA(n_components=pca_components, batch_size=pca_batch_size)
+            pca_model = IncrementalPCA(n_components=pca_components, batch_size=pca_batch_size)
             for i in range(0, len(X_train_flat), pca_batch_size):
-                pca.partial_fit(X_train_flat[i:i+pca_batch_size])
+                pca_model.partial_fit(X_train_flat[i:i+pca_batch_size])
         else:
-            pca = PCA(n_components=pca_components)
-            pca.fit(X_train_flat)
+            pca_model = PCA(n_components=pca_components)
+            pca_model.fit(X_train_flat)
         
-        X_train_flat = pca.transform(X_train_flat)
-        X_val_flat = pca.transform(X_val_flat)
-        X_test_flat = pca.transform(X_test_flat)
+        X_train_flat = pca_model.transform(X_train_flat)
+        X_val_flat = pca_model.transform(X_val_flat)
+        X_test_flat = pca_model.transform(X_test_flat)
         
-        joblib.dump(pca, Path("./artifacts") / "pca_model.pkl")
-        print(f"   Explained variance: {pca.explained_variance_ratio_.sum():.4f}")
+        joblib.dump(pca_model, Path("./artifacts") / "pca_model.pkl")
+        print(f"   Explained variance: {pca_model.explained_variance_ratio_.sum():.4f}")
+        
+        # Update before scaling data for PCA case
+        data_before_scaling = X_train_flat.copy()
     
     # 7. Scale to [-1, 1] (Quantum Encoding Range)
-    print("\n  Scaling to [-1, 1] for quantum encoding...")
+    print("\n⚡ Scaling to [-1, 1] for quantum encoding...")
     scaler = MinMaxScaler(feature_range=(-1, 1))
     X_train_flat = scaler.fit_transform(X_train_flat)
     X_val_flat = scaler.transform(X_val_flat)
     X_test_flat = scaler.transform(X_test_flat)
     
     joblib.dump(scaler, Path("./artifacts") / "scaler.pkl")
+    
+    # Store data after scaling for visualization
+    data_after_scaling = X_train_flat.copy()
     
     # 8. Save Global Datasets
     print(f"\n💾 Saving global datasets to {processed_folder}...")
@@ -338,7 +352,7 @@ def preprocess_mnist(
     # Transform ALL filtered training data once
     X_all_norm = (X_train_filt / 255.0).astype(np.float32).reshape(len(X_train_filt), -1)
     if apply_pca:
-        X_all_norm = pca.transform(X_all_norm)
+        X_all_norm = pca_model.transform(X_all_norm)
     X_all_norm = scaler.transform(X_all_norm)
     
     # Slice for each client
@@ -364,9 +378,9 @@ def preprocess_mnist(
         dist = ", ".join([f"Digit {u}: {c}" for u, c in zip(unique, counts)])
         print(f"   {name:>5}: {dist}")
     
-    # 11. Generate Visualizations    
+    # 11. Generate Basic Visualizations (Original)
     if generate_plots:
-        print("\n📊 Generating visualizations...")
+        print("\n📊 Generating basic visualizations...")
         
         visualize_client_data(
             client_data_orig,
@@ -384,7 +398,6 @@ def preprocess_mnist(
         plot_class_distribution(client_data_orig)
     
     # 12. Save Metadata   
-    
     metadata = {
         'digits': list(digits),
         'num_clients': num_clients,
@@ -406,12 +419,34 @@ def preprocess_mnist(
     with open(Path("./artifacts") / "preprocessing_metadata.json", 'w') as f:
         json.dump(metadata, f, indent=2)
     
-    print("\nQuantum FL Preprocessing Complete!")
-    print("\n""📋 Summary:")
+    # 13. Generate Advanced Visualizations (from viz_preprocess.py)
+    if generate_plots and VISUALIZATIONS_AVAILABLE:
+        try:
+            generate_all_preprocessing_visualizations(
+                pca_model=pca_model if apply_pca else None,
+                data_before_scaling=data_before_scaling,
+                data_after_scaling=data_after_scaling,
+                client_indices=client_indices,
+                client_data=client_data_processed,
+                y_train=y_train_split,
+                y_val=y_val,
+                metadata=metadata,
+                num_classes=len(digits),
+                save_dir="./results/preprocessing"
+            )
+        except Exception as e:
+            print(f"\n⚠️  Warning: Could not generate advanced visualizations: {e}")
+    
+    print("\n" + "="*70)
+    print("✅ Quantum FL Preprocessing Complete!")
+    print("="*70)
+    print("\n📋 Summary:")
     print(f"   Dimensionality: 784D → {X_train_flat.shape[1]}D")
     print(f"   Method: {'PCA + MinMax Scaling' if apply_pca else 'MinMax Scaling Only'}")
     print(f"   Processed data: {processed_folder}")
     print(f"   Artifacts: ./artifacts/")
+    print(f"   Visualizations: ./results/preprocessing/")
+    print("="*70 + "\n")
     
     return datasets['train'], datasets['val'], datasets['test'], client_data_processed
 

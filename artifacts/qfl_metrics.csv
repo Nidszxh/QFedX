@@ -1,0 +1,3 @@
+Round,Test_Accuracy,Test_Loss,Train_Loss
+0,0.505561,1.084180,0.000000
+1,0.955831,0.236021,inf
