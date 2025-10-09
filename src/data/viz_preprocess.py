@@ -20,7 +20,7 @@ def create_viz_folder(base_path: str = "./results/preprocessing") -> Path:
     return folder
 
 
-# ==================== PCA Analysis Plots ====================
+# PCA Analysis Plots
 
 def plot_pca_variance(pca_model, save_path: Optional[str] = None):
     """
@@ -117,7 +117,7 @@ def plot_pca_components_heatmap(pca_model, save_path: Optional[str] = None,
     print(f"📊 PCA components heatmap saved: {save_path}")
 
 
-# ==================== Feature Scaling Verification ====================
+#  Feature Scaling Verification 
 
 def plot_scaling_verification(data_before: np.ndarray, data_after: np.ndarray,
                               save_path: Optional[str] = None, sample_size: int = 5000):
@@ -191,7 +191,7 @@ def plot_scaling_verification(data_before: np.ndarray, data_after: np.ndarray,
     print(f"📊 Scaling verification plot saved: {save_path}")
 
 
-# ==================== Partitioning Distribution ====================
+#  Partitioning Distribution 
 
 def plot_client_sample_counts(client_indices: List[np.ndarray], 
                               save_path: Optional[str] = None):
@@ -363,7 +363,7 @@ def plot_kl_divergence_heatmap(client_data: List[Tuple[torch.Tensor, torch.Tenso
     print(f"📊 KL divergence heatmap saved: {save_path}")
 
 
-# ==================== Validation Split Verification ====================
+#  Validation Split Verification 
 
 def plot_train_val_split_comparison(y_train: np.ndarray, y_val: np.ndarray, 
                                     save_path: Optional[str] = None):
@@ -428,7 +428,7 @@ def plot_train_val_split_comparison(y_train: np.ndarray, y_val: np.ndarray,
     print(f"📊 Train/Val split comparison saved: {save_path}")
 
 
-# ==================== Metadata Summary ====================
+#  Metadata Summary 
 
 def plot_dataset_summary(metadata: Dict, save_path: Optional[str] = None):
     """
@@ -500,7 +500,7 @@ def plot_dataset_summary(metadata: Dict, save_path: Optional[str] = None):
     print(f"📊 Dataset summary saved: {save_path}")
 
 
-# ==================== Main Orchestration Function ====================
+# Main Orchestration Function 
 
 def generate_all_preprocessing_visualizations(
     pca_model=None,
@@ -529,9 +529,8 @@ def generate_all_preprocessing_visualizations(
         num_classes: Number of classes (optional)
         save_dir: Base directory for saving plots
     """
-    print("\n" + "="*60)
+    print("\n" )
     print("🎨 GENERATING PREPROCESSING VISUALIZATIONS")
-    print("="*60)
     
     create_viz_folder(save_dir)
     
@@ -571,7 +570,6 @@ def generate_all_preprocessing_visualizations(
         print("\n📊 Generating dataset summary...")
         plot_dataset_summary(metadata, f"{save_dir}/dataset_summary.png")
     
-    print("\n" + "="*60)
+    print("\n" )
     print("✅ ALL PREPROCESSING VISUALIZATIONS COMPLETE")
-    print(f"📁 Saved to: {save_dir}")
-    print("="*60 + "\n")
+    print(f" Saved to: {save_dir}")

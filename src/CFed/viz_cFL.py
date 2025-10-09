@@ -146,7 +146,7 @@ def plot_client_final_accuracies(client_data: List[Tuple[torch.Tensor, torch.Ten
     print(f"📊 Client final accuracies plot saved: {save_path}")
 
 
-# ==================== Client Data Distribution ====================
+#  Client Data Distribution 
 
 def plot_client_label_distribution_heatmap(client_data: List[Tuple[torch.Tensor, torch.Tensor]],
                                           num_classes: int,
@@ -191,7 +191,7 @@ def plot_client_label_distribution_heatmap(client_data: List[Tuple[torch.Tensor,
     print(f"📊 Client label distribution heatmap saved: {save_path}")
 
 
-# ==================== Training Dynamics ====================
+#  Training Dynamics 
 
 def plot_training_dynamics(metrics: Dict, save_path: Optional[str] = None):
     """
@@ -257,7 +257,7 @@ def plot_training_dynamics(metrics: Dict, save_path: Optional[str] = None):
     print(f"📊 Training dynamics plot saved: {save_path}")
 
 
-# ==================== Model Evaluation ====================
+#  Model Evaluation 
 
 def plot_confusion_matrix(model: nn.Module, test_data: Tuple[torch.Tensor, torch.Tensor],
                          device: torch.device, class_names: List[str] = None,
@@ -312,10 +312,10 @@ def plot_confusion_matrix(model: nn.Module, test_data: Tuple[torch.Tensor, torch
         f.write("Classification Report\n")
         f.write("=" * 50 + "\n")
         f.write(report)
-    print(f"📄 Classification report saved: {report_path}")
+    print(f" Classification report saved: {report_path}")
 
 
-# ==================== Metric Correlation ====================
+#  Metric Correlation 
 
 def plot_metric_correlation(metrics: Dict, save_path: Optional[str] = None):
     """
@@ -350,7 +350,7 @@ def plot_metric_correlation(metrics: Dict, save_path: Optional[str] = None):
     print(f"📊 Metric correlation heatmap saved: {save_path}")
 
 
-# ==================== Feature Visualization ====================
+#  Feature Visualization 
 
 def plot_conv_feature_maps(model: nn.Module, sample_input: torch.Tensor,
                           device: torch.device, save_path: Optional[str] = None):
@@ -408,7 +408,7 @@ def plot_conv_feature_maps(model: nn.Module, sample_input: torch.Tensor,
     print(f"📊 Feature maps visualization saved: {save_path}")
 
 
-# ==================== Embedding Visualization ====================
+#  Embedding Visualization 
 
 def plot_embeddings(model: nn.Module, test_data: Tuple[torch.Tensor, torch.Tensor],
                    device: torch.device, method: str = 'tsne',
@@ -478,7 +478,7 @@ def plot_embeddings(model: nn.Module, test_data: Tuple[torch.Tensor, torch.Tenso
     print(f"📊 Embeddings visualization saved: {save_path}")
 
 
-# ==================== Summary Metrics Table ====================
+#  Summary Metrics Table 
 
 def create_summary_table(metrics: Dict, config: Dict, save_path: Optional[str] = None):
     """
@@ -523,7 +523,7 @@ def create_summary_table(metrics: Dict, config: Dict, save_path: Optional[str] =
     
     df = pd.DataFrame(summary_data)
     df.to_csv(save_path, index=False)
-    print(f"📄 Summary table saved: {save_path}")
+    print(f" Summary table saved: {save_path}")
     
     # Also create a visual table
     fig, ax = plt.subplots(figsize=(10, 8))
@@ -557,7 +557,7 @@ def create_summary_table(metrics: Dict, config: Dict, save_path: Optional[str] =
     print(f"📊 Summary table image saved: {table_img_path}")
 
 
-# ==================== Main Orchestration Function ====================
+#  Main Orchestration Function 
 
 def generate_all_cfl_visualizations(
     metrics: Dict,
@@ -584,9 +584,8 @@ def generate_all_cfl_visualizations(
         class_names: Optional list of class names
         save_dir: Base directory for saving plots
     """
-    print("\n" + "="*60)
+    print("\n")
     print("🎨 GENERATING CLASSICAL FL VISUALIZATIONS")
-    print("="*60)
     
     create_viz_folder(save_dir)
     
@@ -636,7 +635,7 @@ def generate_all_cfl_visualizations(
     print("\n📊 Generating summary metrics table...")
     create_summary_table(metrics, config, f"{save_dir}/summary_metrics.csv")
     
-    print("\n" + "="*60)
+    print("\n")
     print("✅ ALL CLASSICAL FL VISUALIZATIONS COMPLETE")
-    print(f"📁 Saved to: {save_dir}")
-    print("="*60 + "\n")
+    print(f" Saved to: {save_dir}")
+    print("\n")

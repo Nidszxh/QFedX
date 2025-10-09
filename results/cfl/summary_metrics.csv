@@ -1,12 +1,12 @@
 Metric,Value
-Final Test Accuracy,0.9990
-Final Test Loss,0.0017
-Final Train Loss,0.0010
-Best Test Accuracy,0.9994
-Convergence Round (Best Acc),10
-Total Rounds,30
+Final Test Accuracy,0.9987
+Final Test Loss,0.0028
+Final Train Loss,0.0117
+Best Test Accuracy,0.9987
+Convergence Round (Best Acc),12
+Total Rounds,15
 Number of Clients,4
-Local Epochs,5
-Learning Rate,0.01
-Batch Size,32
+Local Epochs,2
+Learning Rate,0.001
+Batch Size,16
 Partition Type,iid

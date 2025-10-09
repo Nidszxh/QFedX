@@ -10,12 +10,12 @@
   "apply_pca": false,
   "pca_components": null,
   "use_incremental_pca": null,
-  "val_split": 0.1,
+  "val_split": 0.25,
   "seed": 42,
   "feature_dim": 784,
   "samples": {
-    "train": 16760,
-    "val": 1863,
+    "train": 13967,
+    "val": 4656,
     "test": 3147
   }
 }
