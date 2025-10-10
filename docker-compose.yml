@@ -1,0 +1,66 @@
+version: '3.7'
+
+services:
+  server:
+    image: sha256:7634f6de7d0869e51a02bb3e69f1967e67f173be5bd648039eb3cd244007e005  # Replace with your actual server image
+    container_name: qfl_server
+    ports:
+      - "8080:8080"  # Expose the server port
+    environment:
+      - SERVER_ADDRESS=qfl_server:8080  # Server address within the Docker network
+
+  client1:
+    image: sha256:7634f6de7d0869e51a02bb3e69f1967e67f173be5bd648039eb3cd244007e005  # Replace with your actual client image
+    container_name: qfl_client1
+    environment:
+      - SERVER_ADDRESS=qfl_server:8080  # Connect to the server using the service name
+    depends_on:
+      - server
+    runtime: nvidia  # Use GPU (if applicable)
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]  # Request GPU for client if needed
+
+  client2:
+    image: sha256:7634f6de7d0869e51a02bb3e69f1967e67f173be5bd648039eb3cd244007e005  # Replace with your actual client image
+    container_name: qfl_client2
+    environment:
+      - SERVER_ADDRESS=qfl_server:8080
+    depends_on:
+      - server
+    runtime: nvidia  # Use GPU (if applicable)
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]  # Request GPU for client if needed
+
+  client3:
+    image: sha256:7634f6de7d0869e51a02bb3e69f1967e67f173be5bd648039eb3cd244007e005  # Replace with your actual client image
+    container_name: qfl_client3
+    environment:
+      - SERVER_ADDRESS=qfl_server:8080
+    depends_on:
+      - server
+    runtime: nvidia  # Use GPU (if applicable)
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]  # Request GPU for client if needed
+
+  client4:
+    image: sha256:7634f6de7d0869e51a02bb3e69f1967e67f173be5bd648039eb3cd244007e005  # Replace with your actual client image
+    container_name: qfl_client4
+    environment:
+      - SERVER_ADDRESS=qfl_server:8080
+    depends_on:
+      - server
+    runtime: nvidia  # Use GPU (if applicable)
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]  # Request GPU for client if needed
