@@ -21,7 +21,7 @@ try:
     from viz_cFL import generate_all_cfl_visualizations
     VISUALIZATIONS_AVAILABLE = True
 except ImportError:
-    print("⚠️  Warning: viz_cFL.py not found. Visualizations will be skipped.")
+    print(" Warning: viz_cFL.py not found. Visualizations will be skipped.")
     VISUALIZATIONS_AVAILABLE = False
 
 # Configuration and Device Setup
@@ -197,9 +197,7 @@ def federated_learning(client_data: List[Tuple[torch.Tensor, torch.Tensor]], tes
     # Metrics tracking
     test_accuracies, test_losses, train_losses = [], [], []
     
-    print("\n" + "="*70)
-    print("Federated Learning Training")
-    print("="*70)
+    print("\n Federated Learning Training")
     print(f"   Total clients: {num_clients}")
     print(f"   Participation rate: {client_fraction:.0%}")
     print(f"   Rounds: {num_rounds}")
@@ -243,13 +241,10 @@ def federated_learning(client_data: List[Tuple[torch.Tensor, torch.Tensor]], tes
         
         if round_num % 5 == 0 or round_num == num_rounds:
             print(f"Round {round_num:>3}: Selected {num_selected} clients | Test Acc = {test_acc:.4f} | Test Loss = {test_loss:.4f}")
-    
-    # Final results
-    print(f"\n🎉 Final accuracy: {test_accuracies[-1]:.4f}")
-    
+            print(f"          Avg Train Loss = {avg_train_loss:.4f}")    
     # Save model
     torch.save(global_model.state_dict(), Path(save_dir) / "global_model.pt")
-    print(f" Model saved: {save_dir}/global_model.pt")
+    print(f"     Model saved: {save_dir}/global_model.pt")
     
     # Save metrics CSV
     with open(Path(save_dir) / "metrics.csv", "w", newline="") as f:
@@ -271,7 +266,7 @@ def main():
         'num_clients': 4,
         'partition_type': 'iid',
         'alpha': 0.5,
-        'num_rounds': 15,
+        'num_rounds': 30,
         'local_epochs': 2,  # Lower epochs
         'learning_rate': 0.00001,  # Lower learning rate
         'batch_size': 16,  # Smaller batch size
@@ -279,9 +274,7 @@ def main():
         'save_dir': './artifacts'
     }
     
-    print("\n" + "="*70)
-    print("Classical Federated Learning on MNIST")
-    print("="*70)
+    print("\nClassical Federated Learning on MNIST")
     print("\n📋 Configuration:")
     for k, v in config.items():
         print(f"  {k:20s}: {v}")

@@ -17,7 +17,7 @@ try:
     from viz_preprocess import generate_all_preprocessing_visualizations
     VISUALIZATIONS_AVAILABLE = True
 except ImportError:
-    print("  Warning: viz_preprocess.py not found. Visualizations will be skipped.")
+    print("Warning: viz_preprocess.py not found. Visualizations will be skipped.")
     VISUALIZATIONS_AVAILABLE = False
 
 def read_idx_images(filename: str) -> np.ndarray:
@@ -212,11 +212,10 @@ def preprocess_mnist(
     # Directory setup
     for path in [processed_folder, "./results", "./artifacts"]:
         Path(path).mkdir(parents=True, exist_ok=True)
-    
-    # 1. Load Raw Data    
-    print("\n")
-    print("Quantum Federated Learning - MNIST Preprocessing")
-    
+
+    # 1. Load Raw Data
+    print(" Quantum Federated Learning - MNIST Preprocessing")
+
     try:
         file_map = {
             'train_images': "train-images.idx3-ubyte",
@@ -230,7 +229,7 @@ def preprocess_mnist(
         X_test = read_idx_images(Path(raw_folder) / file_map['test_images'])
         y_test = read_idx_labels(Path(raw_folder) / file_map['test_labels'])
         
-        print(f"\n✅ Raw data loaded: Train {X_train.shape}, Test {X_test.shape}")
+        print(f"\nRaw data loaded: Train {X_train.shape}, Test {X_test.shape}")
         
     except (FileNotFoundError, ValueError) as e:
         print(f" Error loading raw data: {e}")
@@ -270,7 +269,7 @@ def preprocess_mnist(
         print(f"     Client {i+1}: {len(idx):>5} samples  [{dist}]")
     
     # 4. Train/Val Split (Before Transformation)  
-    print(f"\n  Splitting train/val ({1-val_split:.0%}/{val_split:.0%})...")
+    print(f"\n Splitting train/val ({1-val_split:.0%}/{val_split:.0%})...")
     train_idx, val_idx = train_test_split(
         np.arange(len(y_train_filt)),
         test_size=val_split,
@@ -436,9 +435,7 @@ def preprocess_mnist(
         except Exception as e:
             print(f"\n  Warning: Could not generate advanced visualizations: {e}")
     
-    print("\n")
-    print("✅ Quantum FL Preprocessing Complete!")
-    print("="*70)
+    print(" Quantum FL Preprocessing Complete!")
     print("\n📋 Summary:")
     print(f"   Dimensionality: 784D → {X_train_flat.shape[1]}D")
     print(f"   Method: {'PCA + MinMax Scaling' if apply_pca else 'MinMax Scaling Only'}")

@@ -26,7 +26,7 @@ class QNNConfig:
     n_features: int = 4
     n_classes: int = 3
     batch_size: int = 16
-    epochs: int = 5
+    epochs: int = 5 #20 for real training
     classical_lr: float = 1e-3
     quantum_lr: float = 5e-4
     weight_decay: float = 1e-4

@@ -351,7 +351,7 @@ def main():
         results = qfl.train(client_data, test_data)
         qfl.save_results()
         
-        # Generate visualizations
+        # Generate QFL-specific visualizations
         print("\nGenerating QFL visualizations...")
         try:
             from viz_qFL import generate_all_qfl_plots
@@ -385,6 +385,92 @@ def main():
             print(f"Visualization error: {e}")
             import traceback
             traceback.print_exc()
+        
+
+        print("\nSTARTING COMPARATIVE ANALYSIS")
+        
+        # Check if classical FL results exist
+        cfl_metrics_path = Path('./artifacts/metrics.csv')
+        
+        if cfl_metrics_path.exists():
+            print("\n✓ Found Classical FL results, loading for comparison...")
+            
+            # Load classical FL metrics
+            import csv
+            cfl_results = {'test_accuracies': [], 'test_losses': [], 'train_losses': []}
+            
+            with open(cfl_metrics_path, 'r') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    cfl_results['test_accuracies'].append(float(row['Test_Accuracy']))
+                    cfl_results['test_losses'].append(float(row['Test_Loss']))
+                    cfl_results['train_losses'].append(float(row['Train_Loss']))
+            
+            print(f"  Loaded {len(cfl_results['test_accuracies'])} rounds of Classical FL data")
+            
+            # Generate comparative analysis
+            try:
+                from viz_comparative_analysis import generate_all_comparative_plots, plot_3d_performance_surface
+                
+                comparative_plots = generate_all_comparative_plots(
+                    qfl_results=results,
+                    cfl_results=cfl_results,
+                    qfl_model=qfl.global_model,
+                    client_data=client_data,
+                    qnn_config=qnn_config.to_dict(),
+                    qfl_config=fl_config,
+                    save_dir='./visualizations/comparative'
+                )
+                
+                print(f"\n✓ Generated {len(comparative_plots)} comparative analysis plots")
+                
+                # Bonus: 3D surface plot
+                try:
+                    surface_plot = plot_3d_performance_surface(
+                        results, cfl_results, './visualizations/comparative'
+                    )
+                    comparative_plots['3d_surface'] = surface_plot
+                    print("  ✓ 3D Performance Surface")
+                except Exception as e:
+                    print(f"  ✗ 3D surface plot failed: {e}")
+                
+                # Print summary
+                print("\n" + "="*70)
+                print("COMPARATIVE ANALYSIS SUMMARY")
+                print("="*70)
+                
+                final_q_acc = results['test_accuracies'][-1]
+                final_c_acc = cfl_results['test_accuracies'][-1]
+                improvement = (final_q_acc - final_c_acc) * 100
+                
+                print(f"\nFinal Accuracies:")
+                print(f"  Quantum FL:   {final_q_acc:.4f}")
+                print(f"  Classical FL: {final_c_acc:.4f}")
+                print(f"  Improvement:  {improvement:+.2f}%")
+                
+                best_q = max(results['test_accuracies'][1:]) if len(results['test_accuracies']) > 1 else final_q_acc
+                best_c = max(cfl_results['test_accuracies'][1:]) if len(cfl_results['test_accuracies']) > 1 else final_c_acc
+                
+                print(f"\nBest Accuracies:")
+                print(f"  Quantum FL:   {best_q:.4f}")
+                print(f"  Classical FL: {best_c:.4f}")
+                print(f"  Improvement:  {(best_q - best_c)*100:+.2f}%")
+                
+                print(f"\nAll comparative plots saved to: ./visualizations/comparative/")
+                print("="*70 + "\n")
+            
+            except ImportError as e:
+                print(f"\n✗ Comparative visualization module not available: {e}")
+                print("  Please ensure viz_comparative_analysis.py is in the same directory")
+            except Exception as e:
+                print(f"\n✗ Comparative analysis failed: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        else:
+            print("\n⚠ Classical FL results not found at './artifacts/metrics.csv'")
+            print("  Run cFL.py first to generate classical results for comparison")
+            print("  Comparative analysis will be skipped.")
         
         print("\nQUANTUM FEDERATED LEARNING COMPLETED SUCCESSFULLY\n")
         return results

@@ -21,7 +21,6 @@ def create_viz_folder(base_path: str = "./results/preprocessing") -> Path:
 
 
 # PCA Analysis Plots
-
 def plot_pca_variance(pca_model, save_path: Optional[str] = None):
     """
     Plot explained variance ratio and cumulative variance for PCA components.
@@ -115,7 +114,6 @@ def plot_pca_components_heatmap(pca_model, save_path: Optional[str] = None,
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close(fig)
     print(f"📊 PCA components heatmap saved: {save_path}")
-
 
 #  Feature Scaling Verification 
 
@@ -529,8 +527,7 @@ def generate_all_preprocessing_visualizations(
         num_classes: Number of classes (optional)
         save_dir: Base directory for saving plots
     """
-    print("\n" )
-    print("🎨 GENERATING PREPROCESSING VISUALIZATIONS")
+    print("\n  GENERATING PREPROCESSING VISUALIZATIONS")
     
     create_viz_folder(save_dir)
     
@@ -569,7 +566,7 @@ def generate_all_preprocessing_visualizations(
     if metadata is not None:
         print("\n📊 Generating dataset summary...")
         plot_dataset_summary(metadata, f"{save_dir}/dataset_summary.png")
-    
-    print("\n" )
-    print("✅ ALL PREPROCESSING VISUALIZATIONS COMPLETE")
+
+    print("\n")
+    print(f" ALL PREPROCESSING VISUALIZATIONS COMPLETE")
     print(f" Saved to: {save_dir}")
