@@ -12,8 +12,16 @@ from sklearn.model_selection import train_test_split
 from sklearn.decomposition import PCA, IncrementalPCA
 from sklearn.preprocessing import MinMaxScaler
 
+# Import visualization utilities
+try:
+    from viz_preprocess import generate_all_preprocessing_visualizations
+    VISUALIZATIONS_AVAILABLE = True
+except ImportError:
+    print("Warning: viz_preprocess.py not found. Visualizations will be skipped.")
+    VISUALIZATIONS_AVAILABLE = False
+
 def read_idx_images(filename: str) -> np.ndarray:
-    """Memory-efficient IDX image reader with proper header parsing."""
+    # Memory-efficient IDX image reader with proper header parsing.
     with open(filename, 'rb') as f:
         magic, num_images, rows, cols = np.frombuffer(f.read(16), dtype='>i4')
         if magic != 2051:
@@ -22,7 +30,7 @@ def read_idx_images(filename: str) -> np.ndarray:
     return data.reshape(num_images, rows, cols)
 
 def read_idx_labels(filename: str) -> np.ndarray:
-    """Memory-efficient IDX label reader with proper header parsing."""
+    # Memory-efficient IDX label reader with proper header parsing.
     with open(filename, 'rb') as f:
         magic, num_labels = np.frombuffer(f.read(8), dtype='>i4')
         if magic != 2049:
@@ -32,12 +40,12 @@ def read_idx_labels(filename: str) -> np.ndarray:
 
 # Partitioning Logic (IID and Non-IID via Dirichlet)
 def create_iid_partition(indices: np.ndarray, num_clients: int, rng: np.random.Generator) -> List[np.ndarray]:
-    """Create IID partition using indices (zero-copy until final assignment)."""
+    # Create IID partition using indices (zero-copy until final assignment)."""
     rng.shuffle(indices)
     return np.array_split(indices, num_clients)  # Cleaner than manual slicing
 
 def create_non_iid_partition(y_data: np.ndarray, num_clients: int, alpha: float, rng: np.random.Generator) -> List[np.ndarray]:
-    """Optimized non-IID partition using Dirichlet distribution."""
+    # Optimized non-IID partition using Dirichlet distribution.
     num_classes = len(np.unique(y_data))
     label_indices = [np.where(y_data == i)[0] for i in range(num_classes)]
     client_indices = [[] for _ in range(num_clients)]
@@ -55,7 +63,7 @@ def create_non_iid_partition(y_data: np.ndarray, num_clients: int, alpha: float,
     return [np.array(idx, dtype=np.int64) for idx in client_indices]
 
 def create_partition(y_data: np.ndarray, num_clients: int, alpha: Optional[float] = None, seed: int = 42) -> List[np.ndarray]:
-    """Unified partition API: IID if alpha=None, else Dirichlet non-IID."""
+    # Unified partition API: IID if alpha=None, else Dirichlet non-IID.
     rng = np.random.default_rng(seed)
     indices = np.arange(len(y_data))
     
@@ -65,7 +73,7 @@ def create_partition(y_data: np.ndarray, num_clients: int, alpha: Optional[float
 # Visualization Functions
 def visualize_client_data(client_data: List[Tuple], save_path: Optional[str] = None, 
                           samples_per_client: int = 5, is_pca: bool = False):
-    """Visualize client data: PCA scatter or image grid."""
+    # Visualize client data: PCA scatter or image grid.
     num_clients = len(client_data)
     max_clients_plot = min(num_clients, 8)
     
@@ -118,7 +126,7 @@ def visualize_client_data(client_data: List[Tuple], save_path: Optional[str] = N
     plt.close(fig)
 
 def plot_class_distribution(client_data: List[Tuple], save_path: str = "./results/class_distribution.png"):
-    """Plot stacked bar chart of class distribution across clients."""
+    # Plot stacked bar chart of class distribution across clients.
     Path(save_path).parent.mkdir(parents=True, exist_ok=True)
     
     all_classes = sorted(set().union(*[set(y.tolist() if isinstance(y, torch.Tensor) else y) 
@@ -175,12 +183,6 @@ def preprocess_mnist(
     """
     Quantum Federated Learning MNIST preprocessing pipeline.
     
-    Optimizations:
-    - Index-based partitioning (no data copying until final step)
-    - Transform once, slice many (batch processing for clients)
-    - Optional incremental PCA for memory efficiency
-    - Lazy visualization generation
-    
     Args:
         raw_folder: Path to raw MNIST IDX files
         processed_folder: Output path for processed data
@@ -210,10 +212,10 @@ def preprocess_mnist(
     # Directory setup
     for path in [processed_folder, "./results", "./artifacts"]:
         Path(path).mkdir(parents=True, exist_ok=True)
-    
-    # 1. Load Raw Data    
-    print("\nQuantum Federated Learning - MNIST Preprocessing")
-    
+
+    # 1. Load Raw Data
+    print(" Quantum Federated Learning - MNIST Preprocessing")
+
     try:
         file_map = {
             'train_images': "train-images.idx3-ubyte",
@@ -230,7 +232,7 @@ def preprocess_mnist(
         print(f"\nRaw data loaded: Train {X_train.shape}, Test {X_test.shape}")
         
     except (FileNotFoundError, ValueError) as e:
-        print(f"Error loading raw data: {e}")
+        print(f" Error loading raw data: {e}")
         return None
     
     # 2. Filter Digits  
@@ -255,9 +257,9 @@ def preprocess_mnist(
     # Validate partitions
     for i, idx in enumerate(client_indices):
         if len(idx) == 0:
-            raise ValueError(f"❌ Client {i+1} received no data!")
+            raise ValueError(f" Client {i+1} received no data!")
         if len(np.unique(y_train_filt[idx])) == 1:
-            print(f"⚠️  Warning: Client {i+1} has only one class")
+            print(f"  Warning: Client {i+1} has only one class")
     
     print("\n   Client data distribution:")
     for i, idx in enumerate(client_indices):
@@ -267,7 +269,7 @@ def preprocess_mnist(
         print(f"     Client {i+1}: {len(idx):>5} samples  [{dist}]")
     
     # 4. Train/Val Split (Before Transformation)  
-    print(f"\n✂️  Splitting train/val ({1-val_split:.0%}/{val_split:.0%})...")
+    print(f"\n Splitting train/val ({1-val_split:.0%}/{val_split:.0%})...")
     train_idx, val_idx = train_test_split(
         np.arange(len(y_train_filt)),
         test_size=val_split,
@@ -281,36 +283,43 @@ def preprocess_mnist(
     y_val = y_train_filt[val_idx]
     
     # 5. Normalize and Flatten  
-    print("\n🔢 Normalizing and flattening to [0,1]...")
+    print("\n Normalizing and flattening to [0,1]...")
     X_train_flat = (X_train_split / 255.0).astype(np.float32).reshape(len(X_train_split), -1)
     X_val_flat = (X_val_split / 255.0).astype(np.float32).reshape(len(X_val_split), -1)
     X_test_flat = (X_test_filt / 255.0).astype(np.float32).reshape(len(X_test_filt), -1)
     
+    # Store data before scaling for visualization
+    data_before_scaling = X_train_flat.copy()
+    
     # 6. Apply PCA (Optional) 
+    pca_model = None
     if apply_pca:
         if pca_components > X_train_flat.shape[1]:
             raise ValueError(f"PCA components ({pca_components}) > features ({X_train_flat.shape[1]})")
         
-        print(f"\n🧬 Applying PCA: {X_train_flat.shape[1]}D → {pca_components}D")
+        print(f"\n Applying PCA: {X_train_flat.shape[1]}D → {pca_components}D")
         
         if use_incremental_pca and len(X_train_flat) > 10000:
             print(f"   Using Incremental PCA (batch_size={pca_batch_size})")
-            pca = IncrementalPCA(n_components=pca_components, batch_size=pca_batch_size)
+            pca_model = IncrementalPCA(n_components=pca_components, batch_size=pca_batch_size)
             for i in range(0, len(X_train_flat), pca_batch_size):
-                pca.partial_fit(X_train_flat[i:i+pca_batch_size])
+                pca_model.partial_fit(X_train_flat[i:i+pca_batch_size])
         else:
-            pca = PCA(n_components=pca_components)
-            pca.fit(X_train_flat)
+            pca_model = PCA(n_components=pca_components)
+            pca_model.fit(X_train_flat)
         
-        X_train_flat = pca.transform(X_train_flat)
-        X_val_flat = pca.transform(X_val_flat)
-        X_test_flat = pca.transform(X_test_flat)
+        X_train_flat = pca_model.transform(X_train_flat)
+        X_val_flat = pca_model.transform(X_val_flat)
+        X_test_flat = pca_model.transform(X_test_flat)
         
-        joblib.dump(pca, Path("./artifacts") / "pca_model.pkl")
-        print(f"   Explained variance: {pca.explained_variance_ratio_.sum():.4f}")
+        joblib.dump(pca_model, Path("./artifacts") / "pca_model.pkl")
+        print(f"   Explained variance: {pca_model.explained_variance_ratio_.sum():.4f}")
+        
+        # Update before scaling data for PCA case
+        data_before_scaling = X_train_flat.copy()
     
     # 7. Scale to [-1, 1] (Quantum Encoding Range)
-    print("\n  Scaling to [-1, 1] for quantum encoding...")
+    print("\n Scaling to [-1, 1] for quantum encoding...")
     scaler = MinMaxScaler(feature_range=(-1, 1))
     X_train_flat = scaler.fit_transform(X_train_flat)
     X_val_flat = scaler.transform(X_val_flat)
@@ -318,8 +327,11 @@ def preprocess_mnist(
     
     joblib.dump(scaler, Path("./artifacts") / "scaler.pkl")
     
+    # Store data after scaling for visualization
+    data_after_scaling = X_train_flat.copy()
+    
     # 8. Save Global Datasets
-    print(f"\n💾 Saving global datasets to {processed_folder}...")
+    print(f"\n Saving global datasets to {processed_folder}...")
     datasets = {
         'train': (torch.tensor(X_train_flat, dtype=torch.float32),
                   torch.tensor(y_train_split, dtype=torch.long)),
@@ -333,12 +345,12 @@ def preprocess_mnist(
         torch.save(data, Path(processed_folder) / f"{name}.pt")
     
     # 9. Process Client Data (Transform Once, Slice Many)
-    print("\n🌐 Processing client partitions...")
+    print("\n Processing client partitions...")
     
     # Transform ALL filtered training data once
     X_all_norm = (X_train_filt / 255.0).astype(np.float32).reshape(len(X_train_filt), -1)
     if apply_pca:
-        X_all_norm = pca.transform(X_all_norm)
+        X_all_norm = pca_model.transform(X_all_norm)
     X_all_norm = scaler.transform(X_all_norm)
     
     # Slice for each client
@@ -364,9 +376,9 @@ def preprocess_mnist(
         dist = ", ".join([f"Digit {u}: {c}" for u, c in zip(unique, counts)])
         print(f"   {name:>5}: {dist}")
     
-    # 11. Generate Visualizations    
+    # 11. Generate Basic Visualizations (Original)
     if generate_plots:
-        print("\n📊 Generating visualizations...")
+        print("\n📊 Generating basic visualizations...")
         
         visualize_client_data(
             client_data_orig,
@@ -384,7 +396,6 @@ def preprocess_mnist(
         plot_class_distribution(client_data_orig)
     
     # 12. Save Metadata   
-    
     metadata = {
         'digits': list(digits),
         'num_clients': num_clients,
@@ -406,12 +417,32 @@ def preprocess_mnist(
     with open(Path("./artifacts") / "preprocessing_metadata.json", 'w') as f:
         json.dump(metadata, f, indent=2)
     
-    print("\nQuantum FL Preprocessing Complete!")
-    print("\n""📋 Summary:")
+    # 13. Generate Advanced Visualizations (from viz_preprocess.py)
+    if generate_plots and VISUALIZATIONS_AVAILABLE:
+        try:
+            generate_all_preprocessing_visualizations(
+                pca_model=pca_model if apply_pca else None,
+                data_before_scaling=data_before_scaling,
+                data_after_scaling=data_after_scaling,
+                client_indices=client_indices,
+                client_data=client_data_processed,
+                y_train=y_train_split,
+                y_val=y_val,
+                metadata=metadata,
+                num_classes=len(digits),
+                save_dir="./results/preprocessing"
+            )
+        except Exception as e:
+            print(f"\n  Warning: Could not generate advanced visualizations: {e}")
+    
+    print(" Quantum FL Preprocessing Complete!")
+    print("\n📋 Summary:")
     print(f"   Dimensionality: 784D → {X_train_flat.shape[1]}D")
     print(f"   Method: {'PCA + MinMax Scaling' if apply_pca else 'MinMax Scaling Only'}")
     print(f"   Processed data: {processed_folder}")
     print(f"   Artifacts: ./artifacts/")
+    print(f"   Visualizations: ./results/preprocessing/")
+    print("\n")
     
     return datasets['train'], datasets['val'], datasets['test'], client_data_processed
 
