@@ -1,5 +1,3 @@
-# Quantum Federated Learning (QFL) Implementation
-
 import sys
 from pathlib import Path
 sys.path.append(str(Path(__file__).resolve().parent.parent))
@@ -19,6 +17,10 @@ from data.preprocess import preprocess_mnist
 
 
 def set_qfl_seeds(seed: int = 42):
+    """
+    Set random seeds for reproducibility.
+    This function ensures that we get consistent results across different runs by setting seeds for various libraries.
+    """
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -33,7 +35,11 @@ set_qfl_seeds(42)
 def quantum_federated_averaging(client_updates: List[Tuple[Dict, int, float]], 
                                 global_params_template: Dict[str, torch.Tensor],
                                 device: str = 'cpu') -> Tuple[Dict[str, torch.Tensor], float]:
-    """FedAvg aggregation adapted for quantum-classical hybrid models."""
+    """
+    Federated Averaging (FedAvg) aggregation method adapted for quantum-classical hybrid models.
+    This function takes the client updates, aggregates the parameters using weighted average, and returns the
+    aggregated parameters and the weighted loss for the round.
+    """
     if not client_updates:
         raise ValueError("No client updates to aggregate")
     
@@ -43,6 +49,7 @@ def quantum_federated_averaging(client_updates: List[Tuple[Dict, int, float]],
     
     aggregated = {}
     for key, tensor in global_params_template.items():
+        # Handling non-trainable parameters like batch statistics or other non-gradient params
         if tensor.dtype == torch.long or 'num_batches_tracked' in key:
             aggregated[key] = tensor.clone().to(device)
         else:
@@ -50,9 +57,10 @@ def quantum_federated_averaging(client_updates: List[Tuple[Dict, int, float]],
     
     weighted_loss = 0.0
     for params, n_samples, loss in client_updates:
-        weight = n_samples / total_samples
+        weight = n_samples / total_samples  # Weight updates by the number of samples each client processed
         weighted_loss += weight * loss
         for key in aggregated.keys():
+            # Only aggregate parameters that are trainable
             if aggregated[key].dtype != torch.long and 'num_batches_tracked' not in key:
                 aggregated[key] += params[key].to(device) * weight
     
@@ -60,9 +68,20 @@ def quantum_federated_averaging(client_updates: List[Tuple[Dict, int, float]],
 
 
 class QuantumFederatedLearning:
-    """Orchestrator for Quantum Federated Learning with PennyLane QNNs."""
+    """
+    Orchestrator for Quantum Federated Learning with PennyLane QNNs.
+    This class handles the setup, local training, federated averaging, and evaluation of the global model.
+    """
     
     def __init__(self, config: QNNConfig, fl_config: Dict, device: Optional[str] = None):
+        """
+        Initialization of Quantum Federated Learning setup.
+        
+        Parameters:
+        - config: Quantum Neural Network configuration (QNNConfig)
+        - fl_config: Federated learning configuration (number of rounds, batch size, etc.)
+        - device: 'cpu' or 'cuda' (GPU), determines where the model will be trained
+        """
         self.config = config
         self.fl_config = fl_config
         self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
@@ -74,6 +93,10 @@ class QuantumFederatedLearning:
         self._print_initialization_info()
     
     def _print_initialization_info(self):
+        """
+        Prints the initialization information about the Quantum Federated Learning system.
+        Includes details like quantum configuration, federated learning config, and model architecture.
+        """
         print("\nQUANTUM FEDERATED LEARNING SYSTEM")
         print(f"Device: {self.device}")
         print(f"\nQuantum Configuration:")
@@ -92,22 +115,34 @@ class QuantumFederatedLearning:
         print(f"  Quantum parameters: {q_params} ({100*q_params/total_params:.1f}%)")
         print(f"  Classical parameters: {c_params} ({100*c_params/total_params:.1f}%)\n")
     
-    def train_local_client(self, client_data: Tuple[torch.Tensor, torch.Tensor],
-                          client_id: int) -> Tuple[Dict, int, float]:
+    def train_local_client(self, client_data: Tuple[torch.Tensor, torch.Tensor], client_id: int) -> Tuple[Dict, int, float]:
+        """
+        Train the local model for each client, using their local data and the global model's parameters.
+    
+        Parameters:
+        - client_data: Data for the client (X_train, y_train)
+        - client_id: Unique identifier for the client (used for logging purposes)
+    
+        Returns:
+        - state_dict: The updated model parameters after training.
+        - num_samples: The number of samples the client trained on.
+        - avg_loss: The average loss for the client.
+        """
         X_client, y_client = client_data
-        X_client = torch.as_tensor(X_client, dtype=torch.float32)
-        y_client = torch.as_tensor(y_client, dtype=torch.long)
-        
+        X_client = torch.as_tensor(X_client, dtype=torch.float32).to(self.device)
+        y_client = torch.as_tensor(y_client, dtype=torch.long).to(self.device)
+    
         local_model = QuantumNeuralNetwork(self.config).to(self.device)
-        local_model.load_state_dict(self.global_model.state_dict())
-        
+        local_model.load_state_dict(self.global_model.state_dict())  # Initialize with global parameters
+    
+        # DataLoader to handle batches
         train_loader = DataLoader(
             TensorDataset(X_client, y_client),
             batch_size=self.fl_config.get('batch_size', 16),
             shuffle=True, num_workers=0,
             pin_memory=(self.device == 'cuda')
         )
-        
+    
         local_config = QNNConfig(
             n_qubits=self.config.n_qubits, n_features=self.config.n_features,
             n_classes=self.config.n_classes, encoding=self.config.encoding,
@@ -122,19 +157,42 @@ class QuantumFederatedLearning:
             device_name=self.config.device_name,
             diff_method=self.config.diff_method, shots=self.config.shots
         )
-        
+    
         try:
             trainer = QNNTrainer(local_model, local_config, self.device)
+        
+            # Loop over the epochs
             for epoch in range(local_config.epochs):
                 epoch_loss, _ = trainer.train_epoch(train_loader)
+            
+                # Check for NaN or Inf in the loss
+                if torch.isnan(epoch_loss) or torch.isinf(epoch_loss):
+                    print(f"Warning: NaN or Inf detected in loss during training at epoch {epoch}")
+                    return self.global_model.state_dict(), len(X_client), float('inf')
+            
+                # Apply gradient clipping to prevent gradient explosion
+                if self.fl_config.get('grad_clip', None) is not None:
+                    torch.nn.utils.clip_grad_norm_(local_model.parameters(), self.fl_config['grad_clip'])
+            
             avg_loss = trainer.train_losses[-1] if trainer.train_losses else float('inf')
+        
             return local_model.state_dict(), len(X_client), avg_loss
         except Exception as e:
             print(f"  Warning: Client {client_id} training failed: {e}")
             return self.global_model.state_dict(), len(X_client), float('inf')
+
     
-    def federated_round(self, client_data: List[Tuple[torch.Tensor, torch.Tensor]],
-                        round_num: int) -> float:
+    def federated_round(self, client_data: List[Tuple[torch.Tensor, torch.Tensor]], round_num: int) -> float:
+        """
+        Perform one round of federated learning, training models on selected clients and aggregating their updates.
+        
+        Parameters:
+        - client_data: A list of tuples containing client training data.
+        - round_num: The current round number of the federated training.
+        
+        Returns:
+        - avg_train_loss: The average training loss across all selected clients.
+        """
         num_clients = len(client_data)
         client_fraction = self.fl_config.get('client_fraction', 1.0)
         num_selected = max(1, int(client_fraction * num_clients))
@@ -172,6 +230,16 @@ class QuantumFederatedLearning:
     
     @torch.no_grad()
     def evaluate_global(self, test_data: Tuple[torch.Tensor, torch.Tensor]) -> Tuple[float, float]:
+        """
+        Evaluate the global model on test data and return the accuracy and loss.
+        
+        Parameters:
+        - test_data: The test data tuple (X_test, y_test).
+        
+        Returns:
+        - accuracy: The accuracy of the model on the test data.
+        - avg_loss: The average loss on the test data.
+        """
         self.global_model.eval()
         X_test, y_test = test_data
         X_test = torch.as_tensor(X_test, dtype=torch.float32)
@@ -206,8 +274,18 @@ class QuantumFederatedLearning:
         avg_loss = total_loss / total if total > 0 else float('inf')
         return accuracy, avg_loss
     
-    def train(self, client_data: List[Tuple[torch.Tensor, torch.Tensor]],
-                test_data: Tuple[torch.Tensor, torch.Tensor]) -> Dict:
+    def train(self, client_data: List[Tuple[torch.Tensor, torch.Tensor]], test_data: Tuple[torch.Tensor, torch.Tensor]) -> Dict:
+        """
+        The main method that runs the entire federated training process, including model training,
+        federated rounds, and evaluation.
+        
+        Parameters:
+        - client_data: A list of client data.
+        - test_data: The test data used for evaluation.
+        
+        Returns:
+        - results: A dictionary containing the results (test accuracies, losses, etc.).
+        """
         num_rounds = self.fl_config.get('num_rounds', 5)
         
         print("Starting Quantum Federated Learning Training")
@@ -250,6 +328,9 @@ class QuantumFederatedLearning:
         }
     
     def _print_final_summary(self):
+        """
+        Print the final summary of the training process, including the best test accuracy and final loss.
+        """
         print("\nTRAINING COMPLETE")
         final_acc = self.test_accuracies[-1]
         best_acc = max(self.test_accuracies[1:]) if len(self.test_accuracies) > 1 else final_acc
@@ -259,6 +340,12 @@ class QuantumFederatedLearning:
         print(f"Final Test Loss:     {final_loss:.4f}\n")
     
     def save_results(self, save_dir: str = "./artifacts"):
+        """
+        Save the trained model and metrics to files for further analysis.
+        
+        Parameters:
+        - save_dir: Directory where the model and metrics will be saved.
+        """
         os.makedirs(save_dir, exist_ok=True)
         checkpoint = {
             'model_state_dict': self.global_model.state_dict(),
