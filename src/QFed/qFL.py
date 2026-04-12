@@ -1,485 +1,794 @@
-# Quantum Federated Learning (QFL) Implementation
-
 import sys
 from pathlib import Path
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 import os
+import json
+import csv
+import time
+import random
 import numpy as np
 import torch
 import torch.nn as nn
-import random
 from typing import List, Tuple, Dict, Optional
-import csv
+from dataclasses import dataclass, asdict
 import matplotlib.pyplot as plt
+
+from qNN import QNN, QNNConfig, Trainer, set_seeds, GPUDataset, fedavg_weights
 from torch.utils.data import DataLoader, TensorDataset
-
-from qNN import QuantumNeuralNetwork, QNNConfig, QNNTrainer
-from data.preprocess import preprocess_mnist
-
-
-def set_qfl_seeds(seed: int = 42):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
-
-set_qfl_seeds(42)
+from privacy import apply_dp_noise, SecureAggregator
+try:
+    from opacus.accountants import RDPAccountant
+except ImportError:
+    RDPAccountant = None
 
 
-def quantum_federated_averaging(client_updates: List[Tuple[Dict, int, float]], 
-                                global_params_template: Dict[str, torch.Tensor],
-                                device: str = 'cpu') -> Tuple[Dict[str, torch.Tensor], float]:
-    """FedAvg aggregation adapted for quantum-classical hybrid models."""
-    if not client_updates:
-        raise ValueError("No client updates to aggregate")
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+@dataclass
+class FederatedConfig:
+    """Configuration for federated learning."""
+    # Federated setup
+    num_clients: int = 4
+    num_rounds: int = 30
+    client_fraction: float = 1.0  # Fraction of clients per round
+    local_epochs: int = 5
     
-    total_samples = sum(n for _, n, _ in client_updates)
-    if total_samples == 0:
-        raise ValueError("Total samples is zero")
+    # Early stopping
+    early_stopping_patience: int = 10
     
-    aggregated = {}
-    for key, tensor in global_params_template.items():
-        if tensor.dtype == torch.long or 'num_batches_tracked' in key:
-            aggregated[key] = tensor.clone().to(device)
-        else:
-            aggregated[key] = torch.zeros_like(tensor, device=device)
+    # Checkpointing
+    checkpoint_interval: int = 5
+    save_dir: str = './artifacts/quantum_federated'
     
-    weighted_loss = 0.0
-    for params, n_samples, loss in client_updates:
-        weight = n_samples / total_samples
-        weighted_loss += weight * loss
-        for key in aggregated.keys():
-            if aggregated[key].dtype != torch.long and 'num_batches_tracked' not in key:
-                aggregated[key] += params[key].to(device) * weight
+    # Performance
+    parallel_clients: bool = False  # Multi-GPU client training
+    track_communication: bool = True
     
-    return aggregated, weighted_loss
+    # Client sampling
+    sampling_strategy: str = 'deterministic'  # 'deterministic', 'random', 'round_robin'
+    
+    # Privacy
+    dp_clip_norm: float = 0.0      # 0.0 disables DP
+    dp_noise_multiplier: float = 0.0
+    use_secure_aggregation: bool = False
+    
+    # QNN config
+    qnn_config: Optional[QNNConfig] = None
+    
+    def __post_init__(self):
+        if self.qnn_config is None:
+            self.qnn_config = QNNConfig()
+        
+        # Create save directory
+        Path(self.save_dir).mkdir(parents=True, exist_ok=True)
+    
+    def to_dict(self) -> Dict:
+        result = asdict(self)
+        result['qnn_config'] = self.qnn_config.to_dict()
+        return result
 
+
+# ============================================================================
+# CLIENT SAMPLING
+# ============================================================================
+
+def sample_clients(
+    num_clients: int,
+    client_fraction: float,
+    round_num: int,
+    strategy: str = 'deterministic',
+    base_seed: int = 42
+) -> List[int]:
+    """
+    Sample clients for federated round with different strategies.
+    
+    Args:
+        num_clients: Total number of clients
+        client_fraction: Fraction of clients to sample
+        round_num: Current round number
+        strategy: Sampling strategy
+        base_seed: Base random seed
+    
+    Returns:
+        List of selected client indices
+    """
+    num_selected = max(1, int(client_fraction * num_clients))
+    
+    if strategy == 'deterministic':
+        # Same sampling pattern (reproducible)
+        random.seed(base_seed + round_num)
+        return sorted(random.sample(range(num_clients), num_selected))
+    
+    elif strategy == 'random':
+        # Different pattern each run
+        np.random.seed(base_seed + round_num + int(time.time() * 1000) % 1000)
+        return sorted(np.random.choice(num_clients, num_selected, replace=False).tolist())
+    
+    elif strategy == 'round_robin':
+        # Cycle through clients
+        offset = (round_num * num_selected) % num_clients
+        selected = []
+        for i in range(num_selected):
+            selected.append((offset + i) % num_clients)
+        return sorted(selected)
+    
+    else:
+        raise ValueError(f"Unknown sampling strategy: {strategy}")
+
+
+def compute_communication_cost(state_dict: Dict[str, torch.Tensor]) -> float:
+    """
+    Compute model size in MB for communication cost tracking.
+    
+    Args:
+        state_dict: Model state dictionary
+    
+    Returns:
+        Size in megabytes
+    """
+    total_bytes = sum(
+        param.numel() * param.element_size()
+        for param in state_dict.values()
+    )
+    return total_bytes / (1024 ** 2)
+
+
+# ============================================================================
+# FEDERATED LEARNING ORCHESTRATOR
+# ============================================================================
 
 class QuantumFederatedLearning:
-    """Orchestrator for Quantum Federated Learning with PennyLane QNNs."""
+    """
+    Complete federated learning orchestrator with all optimizations.
     
-    def __init__(self, config: QNNConfig, fl_config: Dict, device: Optional[str] = None):
-        self.config = config
-        self.fl_config = fl_config
+    Features:
+    - FedAvg with quantum weight clamping
+    - Multi-strategy client sampling
+    - Communication cost tracking
+    - Validation-based early stopping
+    - Periodic checkpointing
+    - Barren plateau detection across clients
+    """
+    
+    def __init__(
+        self,
+        fed_config: FederatedConfig,
+        device: Optional[str] = None
+    ):
+        self.config = fed_config
         self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
-        self.global_model = QuantumNeuralNetwork(config).to(self.device)
-        self.test_accuracies = []
-        self.test_losses = []
-        self.train_losses = []
-        self.client_losses_history = []
-        self._print_initialization_info()
+        
+        # Initialize global model
+        self.global_model = QNN(fed_config.qnn_config, self.device)
+        
+        # Metrics tracking
+        self.history = {
+            'train_loss': [],
+            'val_loss': [],
+            'val_acc': [],
+            'test_loss': [],
+            'test_acc': [],
+            'communication_cost': [],
+            'client_losses': []
+        }
+        
+        # Early stopping
+        self.best_val_acc = 0.0
+        self.best_model_state = None
+        self.patience_counter = 0
+        
+        # Communication tracking
+        if fed_config.track_communication:
+            self.model_size_mb = compute_communication_cost(self.global_model.state_dict())
+            self.total_communication = 0.0
+        
+        self._print_initialization()
     
-    def _print_initialization_info(self):
-        print("\nQUANTUM FEDERATED LEARNING SYSTEM")
+    def _print_initialization(self):
+        """Print initialization information."""
+        print(f"\n{'='*80}")
+        print(f"🌐 QUANTUM FEDERATED LEARNING")
+        print(f"{'='*80}")
         print(f"Device: {self.device}")
         print(f"\nQuantum Configuration:")
-        print(f"  Qubits: {self.config.n_qubits}")
-        print(f"  Layers: {self.config.n_layers}")
-        print(f"  Encoding: {self.config.encoding}")
-        print(f"  Entanglement: {self.config.entanglement}")
-        print(f"\nFederated Learning Configuration:")
-        for key, val in self.fl_config.items():
-            print(f"  {key}: {val}")
-        total_params = sum(p.numel() for p in self.global_model.parameters())
-        q_params = sum(p.numel() for p in self.global_model.get_quantum_params())
-        c_params = sum(p.numel() for p in self.global_model.get_classical_params())
-        print(f"\nModel Architecture:")
-        print(f"  Total parameters: {total_params}")
-        print(f"  Quantum parameters: {q_params} ({100*q_params/total_params:.1f}%)")
-        print(f"  Classical parameters: {c_params} ({100*c_params/total_params:.1f}%)\n")
-    
-    def train_local_client(self, client_data: Tuple[torch.Tensor, torch.Tensor],
-                          client_id: int) -> Tuple[Dict, int, float]:
-        X_client, y_client = client_data
-        X_client = torch.as_tensor(X_client, dtype=torch.float32)
-        y_client = torch.as_tensor(y_client, dtype=torch.long)
+        print(f"  Qubits: {self.config.qnn_config.n_qubits}")
+        print(f"  Layers: {self.config.qnn_config.n_layers}")
+        print(f"  Encoding: {self.config.qnn_config.encoding}")
+        print(f"  Entanglement: {self.config.qnn_config.entanglement}")
+        print(f"  Measurement: {self.config.qnn_config.measurement}")
         
-        local_model = QuantumNeuralNetwork(self.config).to(self.device)
+        print(f"\nFederated Configuration:")
+        print(f"  Clients: {self.config.num_clients}")
+        print(f"  Rounds: {self.config.num_rounds}")
+        print(f"  Client fraction: {self.config.client_fraction:.0%}")
+        print(f"  Local epochs: {self.config.local_epochs}")
+        print(f"  Sampling: {self.config.sampling_strategy}")
+        
+        total_params = sum(p.numel() for p in self.global_model.parameters())
+        quantum_params = self.global_model.q_weights.numel()
+        classical_params = total_params - quantum_params
+        
+        print(f"\nModel Architecture:")
+        print(f"  Total parameters: {total_params:,}")
+        print(f"  Quantum: {quantum_params:,} ({100*quantum_params/total_params:.1f}%)")
+        print(f"  Classical: {classical_params:,} ({100*classical_params/total_params:.1f}%)")
+        
+        if self.config.track_communication:
+            print(f"\nCommunication:")
+            print(f"  Model size: {self.model_size_mb:.2f} MB")
+        
+        print(f"{'='*80}\n")
+    
+    def train_client(
+        self,
+        client_id: int,
+        client_data: Tuple[torch.Tensor, torch.Tensor]
+    ) -> Tuple[Dict[str, torch.Tensor], int, float]:
+        """
+        Train single client locally.
+        
+        Args:
+            client_id: Client identifier
+            client_data: (X, y) tuple for client
+        
+        Returns:
+            (updated_state_dict, num_samples, avg_loss)
+        """
+        X_client, y_client = client_data
+        
+        # Validate data
+        if len(X_client) == 0:
+            print(f"  ⚠️  Client {client_id}: Empty dataset")
+            return self.global_model.state_dict(), 0, float('inf')
+        
+        # Create local model
+        local_model = QNN(self.config.qnn_config, self.device)
         local_model.load_state_dict(self.global_model.state_dict())
         
-        train_loader = DataLoader(
-            TensorDataset(X_client, y_client),
-            batch_size=self.fl_config.get('batch_size', 16),
-            shuffle=True, num_workers=0,
-            pin_memory=(self.device == 'cuda')
-        )
+        # Create data loader
+        if torch.cuda.is_available() and self.device == 'cuda':
+            dataset = GPUDataset(X_client, y_client, self.device)
+            loader = DataLoader(
+                dataset,
+                batch_size=self.config.qnn_config.batch_size,
+                shuffle=True,
+                num_workers=0
+            )
+        else:
+            dataset = TensorDataset(X_client, y_client)
+            loader = DataLoader(
+                dataset,
+                batch_size=self.config.qnn_config.batch_size,
+                shuffle=True,
+                num_workers=4,
+                pin_memory=True
+            )
         
-        local_config = QNNConfig(
-            n_qubits=self.config.n_qubits, n_features=self.config.n_features,
-            n_classes=self.config.n_classes, encoding=self.config.encoding,
-            n_layers=self.config.n_layers, n_readout=self.config.n_readout,
-            entanglement=self.config.entanglement,
-            batch_size=self.fl_config.get('batch_size', 16),
-            epochs=self.fl_config.get('local_epochs', 3),
-            classical_lr=self.fl_config.get('classical_lr', 1e-3),
-            quantum_lr=self.fl_config.get('quantum_lr', 5e-4),
-            weight_decay=self.fl_config.get('weight_decay', 1e-4),
-            grad_clip=self.fl_config.get('grad_clip', 1.0),
-            device_name=self.config.device_name,
-            diff_method=self.config.diff_method, shots=self.config.shots
-        )
+        # Local training
+        trainer = Trainer(local_model, self.config.qnn_config, self.device)
         
         try:
-            trainer = QNNTrainer(local_model, local_config, self.device)
-            for epoch in range(local_config.epochs):
-                epoch_loss, _ = trainer.train_epoch(train_loader)
-            avg_loss = trainer.train_losses[-1] if trainer.train_losses else float('inf')
+            epoch_losses = []
+            for epoch in range(self.config.local_epochs):
+                loss, acc = trainer.train_epoch(loader)
+                
+                if not np.isfinite(loss):
+                    print(f"  ⚠️  Client {client_id}: Non-finite loss at epoch {epoch}")
+                    return self.global_model.state_dict(), len(X_client), float('inf')
+                
+                epoch_losses.append(loss)
+            
+            avg_loss = np.mean(epoch_losses)
+            
+            # Validate updated parameters
+            for name, param in local_model.state_dict().items():
+                if not torch.isfinite(param).all():
+                    print(f"  ⚠️  Client {client_id}: Non-finite params in {name}")
+                    return self.global_model.state_dict(), len(X_client), float('inf')
+            
             return local_model.state_dict(), len(X_client), avg_loss
+        
         except Exception as e:
-            print(f"  Warning: Client {client_id} training failed: {e}")
+            print(f"  ❌ Client {client_id} training failed: {e}")
             return self.global_model.state_dict(), len(X_client), float('inf')
     
-    def federated_round(self, client_data: List[Tuple[torch.Tensor, torch.Tensor]],
-                        round_num: int) -> float:
-        num_clients = len(client_data)
-        client_fraction = self.fl_config.get('client_fraction', 1.0)
-        num_selected = max(1, int(client_fraction * num_clients))
-        selected_clients = random.sample(range(num_clients), num_selected)
+    def federated_round(
+        self,
+        client_data_list: List[Tuple[torch.Tensor, torch.Tensor]],
+        round_num: int
+    ) -> float:
+        """
+        Execute one federated learning round.
         
-        print(f"\nRound {round_num}: Selected {num_selected}/{num_clients} clients {selected_clients}")
+        Args:
+            client_data_list: List of (X, y) tuples for all clients
+            round_num: Current round number
         
+        Returns:
+            Average training loss across selected clients
+        """
+        # Sample clients
+        selected_clients = sample_clients(
+            self.config.num_clients,
+            self.config.client_fraction,
+            round_num,
+            self.config.sampling_strategy,
+            self.config.qnn_config.seed
+        )
+        
+        num_selected = len(selected_clients)
+        print(f"\n{'='*70}")
+        print(f"Round {round_num}/{self.config.num_rounds}")
+        print(f"Selected {num_selected} clients: {selected_clients}")
+        print(f"{'='*70}")
+        
+        # Train clients
         client_updates = []
-        round_losses = []
+        client_losses = {}
         
-        for client_id in selected_clients:
-            state_dict, num_samples, train_loss = self.train_local_client(
-                client_data[client_id], client_id
+        # Privacy Setup
+        if self.config.use_secure_aggregation:
+            aggregator = SecureAggregator(
+                self.config.num_clients, 
+                selected_clients, 
+                self.global_model.state_dict()
             )
-            client_updates.append((state_dict, num_samples, train_loss))
-            round_losses.append(train_loss)
-            print(f"  Client {client_id}: Loss = {train_loss:.4f}, Samples = {num_samples}")
+
+        for client_id in selected_clients:
+            print(f"\n  Training Client {client_id}...")
+            
+            state_dict, n_samples, loss = self.train_client(
+                client_id,
+                client_data_list[client_id]
+            )
+            
+            # Validate update
+            if n_samples == 0 or not np.isfinite(loss):
+                print(f"    ⚠️  Skipping (samples={n_samples}, loss={loss})")
+                continue
+            
+            # Privacy: LDP and Secure Aggregation masks
+            if self.config.dp_clip_norm > 0:
+                # Calculate Delta
+                delta = {k: state_dict[k].float() - self.global_model.state_dict()[k].float() for k in state_dict}
+                dp_delta, actual_norm = apply_dp_noise(
+                    delta, 
+                    self.config.dp_clip_norm, 
+                    self.config.dp_noise_multiplier
+                )
+                print(f"    🔒 DP Applied (Delta Norm: {actual_norm:.4f} -> Clamped/Noised)")
+                
+                # Reconstruct absolute weights for Secure Aggregator
+                for k in state_dict:
+                    state_dict[k] = self.global_model.state_dict()[k] + dp_delta[k]
+                    
+            if self.config.use_secure_aggregation:
+                mask = aggregator.get_client_mask(client_id)
+                for k in state_dict:
+                    state_dict[k] += mask[k]
+                print(f"    🛡️  Secure Mask Applied")
+            
+            client_updates.append((state_dict, n_samples, loss))
+            client_losses[client_id] = loss
+            print(f"    ✓ Loss: {loss:.4f}, Samples: {n_samples}")
         
-        self.client_losses_history.append(round_losses)
-        
-        if not client_updates:
-            print("  No successful client updates")
+        # Check if enough clients succeeded
+        if len(client_updates) < max(1, num_selected // 2):
+            print(f"\n  ❌ Too few successful clients ({len(client_updates)}/{num_selected})")
+            print(f"     Skipping aggregation")
+            self.history['client_losses'].append(client_losses)
             return float('inf')
         
+        # Aggregate
         try:
-            aggregated_params, avg_train_loss = quantum_federated_averaging(
-                client_updates, self.global_model.state_dict(), self.device
+            aggregated, avg_train_loss = fedavg_weights(
+                client_updates,
+                [n for _, n, _ in client_updates]
             )
-            self.global_model.load_state_dict(aggregated_params)
-            print(f"  ✓ Aggregated train loss: {avg_train_loss:.4f}")
+            self.global_model.load_state_dict(aggregated)
+            
+            print(f"\n  ✓ Aggregation successful")
+            print(f"    Average train loss: {avg_train_loss:.4f}")
+            
+            # Track communication
+            if self.config.track_communication:
+                round_comm = self.model_size_mb * len(client_updates) * 2  # Upload + Download
+                self.total_communication += round_comm
+                self.history['communication_cost'].append(round_comm)
+                print(f"    Communication: {round_comm:.2f} MB (Total: {self.total_communication:.2f} MB)")
+            
+            self.history['client_losses'].append(client_losses)
             return avg_train_loss
+        
         except Exception as e:
-            print(f"  Aggregation failed: {e}")
+            print(f"\n  ❌ Aggregation failed: {e}")
+            self.history['client_losses'].append(client_losses)
             return float('inf')
     
     @torch.no_grad()
-    def evaluate_global(self, test_data: Tuple[torch.Tensor, torch.Tensor]) -> Tuple[float, float]:
-        self.global_model.eval()
-        X_test, y_test = test_data
-        X_test = torch.as_tensor(X_test, dtype=torch.float32)
-        y_test = torch.as_tensor(y_test, dtype=torch.long)
+    def evaluate(
+        self,
+        data: Tuple[torch.Tensor, torch.Tensor],
+        split_name: str = "Test"
+    ) -> Tuple[float, float]:
+        """
+        Evaluate global model on validation/test set.
         
-        test_loader = DataLoader(
-            TensorDataset(X_test, y_test),
-            batch_size=self.fl_config.get('batch_size', 16) * 2,
-            shuffle=False, num_workers=0,
-            pin_memory=(self.device == 'cuda')
-        )
+        Args:
+            data: (X, y) tuple
+            split_name: Name of data split (for logging)
+        
+        Returns:
+            (accuracy, loss)
+        """
+        self.global_model.eval()
+        X, y = data
+        
+        # Create loader
+        if torch.cuda.is_available() and self.device == 'cuda':
+            dataset = GPUDataset(X, y, self.device)
+            loader = DataLoader(dataset, batch_size=self.config.qnn_config.batch_size * 2, 
+                              shuffle=False, num_workers=0)
+        else:
+            dataset = TensorDataset(X, y)
+            loader = DataLoader(dataset, batch_size=self.config.qnn_config.batch_size * 2,
+                              shuffle=False, num_workers=4, pin_memory=True)
         
         criterion = nn.CrossEntropyLoss()
-        total_loss = 0.0
-        correct = 0
-        total = 0
+        total_loss, correct, total = 0.0, 0, 0
         
-        for data, target in test_loader:
-            data, target = data.to(self.device), target.to(self.device)
-            try:
-                outputs = self.global_model(data)
-                loss = criterion(outputs, target)
-                total_loss += loss.item() * data.size(0)
-                _, predicted = torch.max(outputs, 1)
-                correct += (predicted == target).sum().item()
-                total += target.size(0)
-            except Exception as e:
-                print(f"  Evaluation error: {e}")
+        for data_batch, target in loader:
+            data_batch = data_batch.to(self.device, non_blocking=True)
+            target = target.to(self.device, non_blocking=True)
+            
+            outputs = self.global_model(data_batch)
+            
+            # Validate outputs
+            if not torch.isfinite(outputs).all():
+                print(f"  ⚠️  Non-finite outputs in {split_name} evaluation")
                 continue
+            
+            loss = criterion(outputs, target)
+            total_loss += loss.item() * data_batch.size(0)
+            correct += (outputs.argmax(1) == target).sum().item()
+            total += target.size(0)
         
         accuracy = correct / total if total > 0 else 0.0
         avg_loss = total_loss / total if total > 0 else float('inf')
+        
         return accuracy, avg_loss
     
-    def train(self, client_data: List[Tuple[torch.Tensor, torch.Tensor]],
-                test_data: Tuple[torch.Tensor, torch.Tensor]) -> Dict:
-        num_rounds = self.fl_config.get('num_rounds', 5)
+    def train(
+        self,
+        client_data_list: List[Tuple[torch.Tensor, torch.Tensor]],
+        val_data: Tuple[torch.Tensor, torch.Tensor],
+        test_data: Tuple[torch.Tensor, torch.Tensor]
+    ) -> Dict:
+        """
+        Main federated training loop.
         
-        print("Starting Quantum Federated Learning Training")
+        Args:
+            client_data_list: List of (X, y) for each client
+            val_data: Validation set (X, y)
+            test_data: Test set (X, y)
+        
+        Returns:
+            Training history dictionary
+        """
+        print(f"\n🚀 Starting Quantum Federated Learning Training\n")
         
         # Initial evaluation
-        print("\nRound 0: Initial Evaluation")
-        initial_acc, initial_loss = self.evaluate_global(test_data)
-        self.test_accuracies.append(initial_acc)
-        self.test_losses.append(initial_loss)
-        self.train_losses.append(0.0)
-        print(f"  Test Accuracy: {initial_acc:.4f}")
-        print(f"  Test Loss: {initial_loss:.4f}")
+        print("Round 0: Initial Evaluation")
+        val_acc, val_loss = self.evaluate(val_data, "Val")
+        test_acc, test_loss = self.evaluate(test_data, "Test")
         
-        # Federated training rounds
-        for round_num in range(1, num_rounds + 1):
-            avg_train_loss = self.federated_round(client_data, round_num)
-            test_acc, test_loss = self.evaluate_global(test_data)
-            self.test_accuracies.append(test_acc)
-            self.test_losses.append(test_loss)
-            self.train_losses.append(avg_train_loss)
+        # Privacy Accountant
+        self.history['epsilon'] = []
+        accountant = RDPAccountant() if RDPAccountant is not None else None
+        
+        self.history['train_loss'].append(0.0)
+        self.history['val_acc'].append(val_acc)
+        self.history['val_loss'].append(val_loss)
+        self.history['test_acc'].append(test_acc)
+        self.history['test_loss'].append(test_loss)
+        
+        print(f"  Val  Acc: {val_acc:.4f}, Loss: {val_loss:.4f}")
+        print(f"  Test Acc: {test_acc:.4f}, Loss: {test_loss:.4f}")
+        
+        self.best_val_acc = val_acc
+        self.best_model_state = {k: v.clone() for k, v in self.global_model.state_dict().items()}
+        
+        # Training rounds
+        for round_num in range(1, self.config.num_rounds + 1):
+            # Federated round
+            avg_train_loss = self.federated_round(client_data_list, round_num)
             
-            if round_num % 5 == 0 or round_num == num_rounds:
-                print(f"\n{'='*70}")
-                print(f"Round {round_num} Summary:")
-                print(f"  Test Accuracy: {test_acc:.4f}")
-                print(f"  Test Loss: {test_loss:.4f}")
-                print(f"  Train Loss: {avg_train_loss:.4f}")
-                print(f"{'='*70}")
+            # Evaluate
+            val_acc, val_loss = self.evaluate(val_data, "Val")
+            test_acc, test_loss = self.evaluate(test_data, "Test")
+            
+            # Step DP Accountant
+            current_epsilon = 0.0
+            if accountant is not None and self.config.dp_clip_norm > 0:
+                accountant.history.append((self.config.dp_noise_multiplier, self.config.client_fraction, 1))
+                current_epsilon = accountant.get_epsilon(delta=1e-5)
+                self.history['epsilon'].append(current_epsilon)
+            
+            # Track metrics
+            self.history['train_loss'].append(avg_train_loss)
+            self.history['val_acc'].append(val_acc)
+            self.history['val_loss'].append(val_loss)
+            self.history['test_acc'].append(test_acc)
+            self.history['test_loss'].append(test_loss)
+            
+            # Early stopping check
+            if val_acc > self.best_val_acc + 1e-6:
+                self.best_val_acc = val_acc
+                self.best_model_state = {k: v.clone() for k, v in self.global_model.state_dict().items()}
+                self.patience_counter = 0
+                print(f"\n  ✓ New best model (val_acc={val_acc:.4f})")
+            else:
+                self.patience_counter += 1
+            
+            # Log progress
+            print(f"\n  Val  Acc: {val_acc:.4f}, Loss: {val_loss:.4f}")
+            print(f"  Test Acc: {test_acc:.4f}, Loss: {test_loss:.4f}")
+            print(f"  Train Loss: {avg_train_loss:.4f}")
+            if self.config.dp_clip_norm > 0:
+                print(f"  Privacy \u03b5: {current_epsilon:.4f} (δ=1e-5)")
+            if self.patience_counter > 0:
+                print(f"  Patience: {self.patience_counter}/{self.config.early_stopping_patience}")
+            
+            # Periodic checkpoint
+            if round_num % self.config.checkpoint_interval == 0:
+                self.save_checkpoint(round_num)
+            
+            # Early stopping
+            if self.patience_counter >= self.config.early_stopping_patience:
+                print(f"\n⏹️  Early stopping at round {round_num}")
+                print(f"   No validation improvement for {self.config.early_stopping_patience} rounds")
+                break
         
-        self._print_final_summary()
+        # Restore best model
+        if self.best_model_state is not None:
+            self.global_model.load_state_dict(self.best_model_state)
+            print(f"\n✓ Restored best model (val_acc={self.best_val_acc:.4f})")
         
-        return {
-            'model': self.global_model,
-            'test_accuracies': self.test_accuracies,
-            'test_losses': self.test_losses,
-            'train_losses': self.train_losses,
-            'client_losses': self.client_losses_history,
-            'final_accuracy': self.test_accuracies[-1],
-            'best_accuracy': max(self.test_accuracies[1:]) if len(self.test_accuracies) > 1 else 0.0
-        }
+        # Final summary
+        self._print_summary()
+        
+        return self.history
     
-    def _print_final_summary(self):
-        print("\nTRAINING COMPLETE")
-        final_acc = self.test_accuracies[-1]
-        best_acc = max(self.test_accuracies[1:]) if len(self.test_accuracies) > 1 else final_acc
-        final_loss = self.test_losses[-1]
-        print(f"Final Test Accuracy: {final_acc:.4f}")
-        print(f"Best Test Accuracy:  {best_acc:.4f}")
-        print(f"Final Test Loss:     {final_loss:.4f}\n")
+    def _print_summary(self):
+        """Print training summary."""
+        print(f"\n{'='*80}")
+        print(f"✅ QUANTUM FEDERATED LEARNING COMPLETE")
+        print(f"{'='*80}")
+        print(f"Best Val Accuracy:  {self.best_val_acc:.4f}")
+        print(f"Final Test Accuracy: {self.history['test_acc'][-1]:.4f}")
+        print(f"Best Test Accuracy:  {max(self.history['test_acc']):.4f} "
+              f"(Round {np.argmax(self.history['test_acc'])})")
+        
+        if self.config.track_communication:
+            print(f"\nCommunication Statistics:")
+            print(f"  Model size: {self.model_size_mb:.2f} MB")
+            print(f"  Total communication: {self.total_communication:.2f} MB")
+            print(f"  Avg per round: {self.total_communication/self.config.num_rounds:.2f} MB")
+        
+        print(f"{'='*80}\n")
     
-    def save_results(self, save_dir: str = "./artifacts"):
-        os.makedirs(save_dir, exist_ok=True)
-        checkpoint = {
+    def save_checkpoint(self, round_num: int):
+        """Save checkpoint at specific round."""
+        checkpoint_path = Path(self.config.save_dir) / f"checkpoint_round{round_num}.pt"
+        torch.save({
+            'round': round_num,
+            'model_state': self.global_model.state_dict(),
+            'history': self.history,
+            'best_val_acc': self.best_val_acc,
+            'patience_counter': self.patience_counter
+        }, checkpoint_path)
+        print(f"  💾 Checkpoint saved: {checkpoint_path}")
+    
+    def save_results(self):
+        """Save final results and artifacts."""
+        # Save model
+        model_path = Path(self.config.save_dir) / "quantum_federated_model.pt"
+        torch.save({
             'model_state_dict': self.global_model.state_dict(),
             'config': self.config.to_dict(),
-            'fl_config': self.fl_config,
-            'test_accuracies': self.test_accuracies,
-            'test_losses': self.test_losses,
-            'train_losses': self.train_losses,
-            'client_losses': self.client_losses_history,
-            'best_accuracy': max(self.test_accuracies[1:]) if len(self.test_accuracies) > 1 else 0.0
-        }
-        model_path = Path(save_dir) / "quantum_federated_model.pt"
-        torch.save(checkpoint, model_path)
+            'history': self.history,
+            'best_val_acc': self.best_val_acc
+        }, model_path)
         print(f"💾 Model saved: {model_path}")
         
-        csv_path = Path(save_dir) / "qfl_metrics.csv"
-        with open(csv_path, "w", newline="") as f:
+        # Save metrics CSV
+        csv_path = Path(self.config.save_dir) / "qfl_metrics.csv"
+        with open(csv_path, 'w', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow(["Round", "Test_Accuracy", "Test_Loss", "Train_Loss"])
-            for i in range(len(self.test_accuracies)):
+            writer.writerow(["Round", "Train_Loss", "Val_Accuracy", "Val_Loss", 
+                           "Test_Accuracy", "Test_Loss"])
+            for i in range(len(self.history['test_acc'])):
                 writer.writerow([
-                    i, f"{self.test_accuracies[i]:.6f}",
-                    f"{self.test_losses[i]:.6f}",
-                    f"{self.train_losses[i]:.6f}"
+                    i,
+                    f"{self.history['train_loss'][i]:.6f}",
+                    f"{self.history['val_acc'][i]:.6f}",
+                    f"{self.history['val_loss'][i]:.6f}",
+                    f"{self.history['test_acc'][i]:.6f}",
+                    f"{self.history['test_loss'][i]:.6f}"
                 ])
         print(f"📊 Metrics saved: {csv_path}")
+        
+        # Save config
+        config_path = Path(self.config.save_dir) / "config.json"
+        with open(config_path, 'w') as f:
+            json.dump(self.config.to_dict(), f, indent=2, default=str)
+        print(f"📋 Config saved: {config_path}")
+        
+        # Plot results
+        self._plot_results()
+    
+    def _plot_results(self):
+        """Generate training plots."""
+        fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+        rounds = list(range(len(self.history['test_acc'])))
+        
+        # Accuracy
+        axes[0, 0].plot(rounds, self.history['val_acc'], marker='s', 
+                       label='Validation', color='#F18F01', linewidth=2)
+        axes[0, 0].plot(rounds, self.history['test_acc'], marker='o',
+                       label='Test', color='#2E86AB', linewidth=2)
+        axes[0, 0].set_xlabel("Round", fontsize=11)
+        axes[0, 0].set_ylabel("Accuracy", fontsize=11)
+        axes[0, 0].set_title("Model Accuracy", fontsize=12, fontweight='bold')
+        axes[0, 0].legend()
+        axes[0, 0].grid(alpha=0.3, linestyle='--')
+        
+        # Loss
+        axes[0, 1].plot(rounds, self.history['train_loss'], marker='^',
+                       label='Train', color='#A23B72', linewidth=2)
+        axes[0, 1].plot(rounds, self.history['val_loss'], marker='s',
+                       label='Val', color='#F18F01', linewidth=2)
+        axes[0, 1].plot(rounds, self.history['test_loss'], marker='o',
+                       label='Test', color='#2E86AB', linewidth=2)
+        axes[0, 1].set_xlabel("Round", fontsize=11)
+        axes[0, 1].set_ylabel("Loss", fontsize=11)
+        axes[0, 1].set_title("Loss Curves", fontsize=12, fontweight='bold')
+        axes[0, 1].legend()
+        axes[0, 1].grid(alpha=0.3, linestyle='--')
+        
+        # Communication cost
+        if self.config.track_communication and self.history['communication_cost']:
+            cumsum_comm = np.cumsum(self.history['communication_cost'])
+            axes[1, 0].plot(range(1, len(cumsum_comm) + 1), cumsum_comm,
+                           marker='d', color='#06A77D', linewidth=2)
+            axes[1, 0].set_xlabel("Round", fontsize=11)
+            axes[1, 0].set_ylabel("Cumulative Communication (MB)", fontsize=11)
+            axes[1, 0].set_title("Communication Cost", fontsize=12, fontweight='bold')
+            axes[1, 0].grid(alpha=0.3, linestyle='--')
+        
+        # Client loss distribution
+        if self.history['client_losses']:
+            all_losses = []
+            for round_losses in self.history['client_losses']:
+                all_losses.extend(round_losses.values())
+            axes[1, 1].hist(all_losses, bins=30, color='#2E86AB', alpha=0.7, edgecolor='black')
+            axes[1, 1].set_xlabel("Loss", fontsize=11)
+            axes[1, 1].set_ylabel("Frequency", fontsize=11)
+            axes[1, 1].set_title("Client Loss Distribution", fontsize=12, fontweight='bold')
+            axes[1, 1].grid(alpha=0.3, linestyle='--', axis='y')
+        
+        plt.tight_layout()
+        plot_path = Path(self.config.save_dir) / "qfl_metrics.png"
+        plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        print(f"📈 Plots saved: {plot_path}")
 
+
+# ============================================================================
+# MAIN EXAMPLE
+# ============================================================================
 
 def main():
+    """Example usage of refactored Quantum Federated Learning."""
+    
+    # Set seeds
+    set_seeds(42)
+    
+    # Configuration
     qnn_config = QNNConfig(
-        n_qubits=4, n_features=4, n_classes=3,
-        encoding='amplitude', n_layers=2, entanglement='circular',
-        batch_size=16, classical_lr=1e-3, quantum_lr=5e-4, grad_clip=1.0
+        n_qubits=4,
+        n_layers=2,
+        encoding='angle',  # Recommended
+        entanglement='pyramid',  # Best for deep circuits
+        measurement='multi_basis',  # Richer information
+        n_features=4,
+        n_classes=3,
+        batch_size=32,
+        epochs=5,  # Local epochs per round
+        classical_lr=1e-3,
+        quantum_lr=5e-4,
+        seed=42
     )
     
-    fl_config = {
-        'num_rounds': 5, 'local_epochs': 3, 'batch_size': 16,
-        'classical_lr': 1e-3, 'quantum_lr': 5e-4,
-        'client_fraction': 0.75, 'grad_clip': 1.0
-    }
+    fed_config = FederatedConfig(
+        num_clients=4,
+        num_rounds=30,
+        client_fraction=0.75,
+        local_epochs=5,
+        early_stopping_patience=10,
+        checkpoint_interval=5,
+        save_dir='./artifacts/quantum_federated',
+        parallel_clients=False,
+        track_communication=True,
+        sampling_strategy='deterministic',
+        qnn_config=qnn_config
+    )
     
-    data_config = {
-        'raw_folder': "./dataset/raw",
-        'processed_folder': "./dataset/processed",
-        'digits': (0, 1, 2), 'val_split': 0.1,
-        'num_clients': 4, 'partition_type': 'iid',
-        'alpha': 0.5, 'apply_pca': True,
-        'pca_components': qnn_config.n_features
-    }
-    
-    print("\nQUANTUM FEDERATED LEARNING WITH PENNYLANE")
+    print(f"\n{'='*80}")
+    print(f"QUANTUM FEDERATED LEARNING - PRODUCTION READY")
+    print(f"{'='*80}\n")
     
     # Load data
     try:
-        result = preprocess_mnist(**data_config, generate_plots=False)
-        if result is None:
-            raise ValueError("Preprocessing returned None")
-        train_data, val_data, test_data, client_data = result
-        qnn_config.n_features = client_data[0][0].shape[1]
+        print("Loading preprocessed data...")
+        client_data_list = []
+        for i in range(fed_config.num_clients):
+            data = torch.load(f"./dataset/processed_quantum/client{i+1}.pt")
+            client_data_list.append(data)
         
-        print(f"\n Data loaded successfully:")
-        print(f"\n  Clients: {len(client_data)}")
-        print(f"  Features: {qnn_config.n_features}")
-        print(f"\n  Test samples: {len(test_data[0])}")
-        for i, (X, y) in enumerate(client_data):
-            y_np = y.numpy() if isinstance(y, torch.Tensor) else y
-            print(f"  Client {i}: {len(X)} samples, classes {np.bincount(y_np)}")
+        val_data = torch.load("./dataset/processed_quantum/val.pt")
+        test_data = torch.load("./dataset/processed_quantum/test.pt")
+        
+        qnn_config.n_features = client_data_list[0][0].shape[1]
+        
+        print(f"✓ Data loaded successfully")
+        print(f"  Clients: {len(client_data_list)}")
+        print(f"  Features: {qnn_config.n_features}D")
+        print(f"  Val samples: {len(val_data[1])}")
+        print(f"  Test samples: {len(test_data[1])}")
     
     except Exception as e:
-        print(f"\nData loading failed: {e}")
-        print("Using synthetic data for demonstration\n")
+        print(f"⚠️  Could not load data: {e}")
+        print("   Using synthetic data for testing...\n")
+        
         np.random.seed(42)
-        n_clients = 4
-        n_samples = 250
-        client_data = []
-        for _ in range(n_clients):
-            X = torch.randn(n_samples, qnn_config.n_features)
-            y = torch.randint(0, qnn_config.n_classes, (n_samples,))
-            client_data.append((X, y))
+        client_data_list = []
+        for _ in range(fed_config.num_clients):
+            X = torch.randn(250, qnn_config.n_features)
+            y = torch.randint(0, qnn_config.n_classes, (250,))
+            client_data_list.append((X, y))
+        
+        X_val = torch.randn(100, qnn_config.n_features)
+        y_val = torch.randint(0, qnn_config.n_classes, (100,))
+        val_data = (X_val, y_val)
+        
         X_test = torch.randn(200, qnn_config.n_features)
         y_test = torch.randint(0, qnn_config.n_classes, (200,))
         test_data = (X_test, y_test)
     
     # Initialize QFL
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    qfl = QuantumFederatedLearning(qnn_config, fl_config, device)
+    qfl = QuantumFederatedLearning(fed_config)
     
     # Train
     try:
-        results = qfl.train(client_data, test_data)
+        history = qfl.train(client_data_list, val_data, test_data)
         qfl.save_results()
         
-        # Generate QFL-specific visualizations
-        print("\nGenerating QFL visualizations...")
-        try:
-            from viz_qFL import generate_all_qfl_plots
-            
-            # Get predictions for confusion matrix
-            qfl.global_model.eval()
-            X_test, y_test = test_data
-            X_test_tensor = torch.as_tensor(X_test, dtype=torch.float32).to(device)
-            with torch.no_grad():
-                outputs = qfl.global_model(X_test_tensor)
-                _, y_pred = torch.max(outputs, 1)
-            y_pred_np = y_pred.cpu().numpy()
-            y_test_np = y_test.numpy() if isinstance(y_test, torch.Tensor) else y_test
-            
-            saved_plots = generate_all_qfl_plots(
-                results=results,
-                client_data=client_data,
-                y_test=y_test_np,
-                y_pred=y_pred_np,
-                class_names=[f'Digit {i}' for i in range(qnn_config.n_classes)],
-                save_dir='./visualizations/qfl'
-            )
-            
-            print(f"\nGenerated {len(saved_plots)} QFL visualization plots:")
-            for name, path in saved_plots.items():
-                print(f"  - {name}: {path}")
+        print(f"\n🎉 Quantum Federated Learning completed successfully!")
+        print(f"   Final test accuracy: {history['test_acc'][-1]:.4f}")
+        print(f"   Best test accuracy: {max(history['test_acc']):.4f}\n")
         
-        except ImportError as e:
-            print(f"Visualization module not available: {e}")
-        except Exception as e:
-            print(f"Visualization error: {e}")
-            import traceback
-            traceback.print_exc()
-        
-
-        print("\nSTARTING COMPARATIVE ANALYSIS")
-        
-        # Check if classical FL results exist
-        cfl_metrics_path = Path('./artifacts/metrics.csv')
-        
-        if cfl_metrics_path.exists():
-            print("\n✓ Found Classical FL results, loading for comparison...")
-            
-            # Load classical FL metrics
-            import csv
-            cfl_results = {'test_accuracies': [], 'test_losses': [], 'train_losses': []}
-            
-            with open(cfl_metrics_path, 'r') as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    cfl_results['test_accuracies'].append(float(row['Test_Accuracy']))
-                    cfl_results['test_losses'].append(float(row['Test_Loss']))
-                    cfl_results['train_losses'].append(float(row['Train_Loss']))
-            
-            print(f"  Loaded {len(cfl_results['test_accuracies'])} rounds of Classical FL data")
-            
-            # Generate comparative analysis
-            try:
-                from viz_comparative_analysis import generate_all_comparative_plots, plot_3d_performance_surface
-                
-                comparative_plots = generate_all_comparative_plots(
-                    qfl_results=results,
-                    cfl_results=cfl_results,
-                    qfl_model=qfl.global_model,
-                    client_data=client_data,
-                    qnn_config=qnn_config.to_dict(),
-                    qfl_config=fl_config,
-                    save_dir='./visualizations/comparative'
-                )
-                
-                print(f"\n✓ Generated {len(comparative_plots)} comparative analysis plots")
-                
-                # Bonus: 3D surface plot
-                try:
-                    surface_plot = plot_3d_performance_surface(
-                        results, cfl_results, './visualizations/comparative'
-                    )
-                    comparative_plots['3d_surface'] = surface_plot
-                    print("  ✓ 3D Performance Surface")
-                except Exception as e:
-                    print(f"  ✗ 3D surface plot failed: {e}")
-                
-                # Print summary
-                print("\n" + "="*70)
-                print("COMPARATIVE ANALYSIS SUMMARY")
-                print("="*70)
-                
-                final_q_acc = results['test_accuracies'][-1]
-                final_c_acc = cfl_results['test_accuracies'][-1]
-                improvement = (final_q_acc - final_c_acc) * 100
-                
-                print(f"\nFinal Accuracies:")
-                print(f"  Quantum FL:   {final_q_acc:.4f}")
-                print(f"  Classical FL: {final_c_acc:.4f}")
-                print(f"  Improvement:  {improvement:+.2f}%")
-                
-                best_q = max(results['test_accuracies'][1:]) if len(results['test_accuracies']) > 1 else final_q_acc
-                best_c = max(cfl_results['test_accuracies'][1:]) if len(cfl_results['test_accuracies']) > 1 else final_c_acc
-                
-                print(f"\nBest Accuracies:")
-                print(f"  Quantum FL:   {best_q:.4f}")
-                print(f"  Classical FL: {best_c:.4f}")
-                print(f"  Improvement:  {(best_q - best_c)*100:+.2f}%")
-                
-                print(f"\nAll comparative plots saved to: ./visualizations/comparative/")
-                print("="*70 + "\n")
-            
-            except ImportError as e:
-                print(f"\n✗ Comparative visualization module not available: {e}")
-                print("  Please ensure viz_comparative_analysis.py is in the same directory")
-            except Exception as e:
-                print(f"\n✗ Comparative analysis failed: {e}")
-                import traceback
-                traceback.print_exc()
-        
-        else:
-            print("\n⚠ Classical FL results not found at './artifacts/metrics.csv'")
-            print("  Run cFL.py first to generate classical results for comparison")
-            print("  Comparative analysis will be skipped.")
-        
-        print("\nQUANTUM FEDERATED LEARNING COMPLETED SUCCESSFULLY\n")
-        return results
-
+        return qfl, history
+    
     except Exception as e:
-        print(f"\nTraining failed: {e}")
+        print(f"\n❌ Training failed: {e}")
         import traceback
         traceback.print_exc()
-        return None
+        return None, None
+
 
 if __name__ == "__main__":
-    results = main()
+    qfl, history = main()

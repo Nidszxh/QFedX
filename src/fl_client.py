@@ -22,7 +22,7 @@ from torch.utils.tensorboard import SummaryWriter
 from typing import List, Dict, Any
 
 # Import QNN modules
-from QFed.qNN import QNNConfig, QuantumNeuralNetwork, QNNTrainer
+from QFed.qNN import QNNConfig, QNN, Trainer
 
 # ===========================
 # Prometheus Metrics Setup
@@ -55,8 +55,8 @@ class QFLClient(NumPyClient):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
         # Model + Trainer
-        self.model = QuantumNeuralNetwork(self.qcfg).to(self.device)
-        self.trainer = QNNTrainer(self.model, self.qcfg, device=self.device)
+        self.model = QNN(self.qcfg, self.device).to(self.device)
+        self.trainer = Trainer(self.model, self.qcfg, self.device)
 
         # Data
         X_local, y_local = local_data
