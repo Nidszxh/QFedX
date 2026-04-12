@@ -1,8 +1,3 @@
-"""
-Classical Federated Learning with CNN
-Optimized for correctness, performance, and reproducibility
-"""
-
 import sys
 from pathlib import Path
 sys.path.append(str(Path(__file__).resolve().parent.parent))
@@ -21,16 +16,16 @@ from typing import List, Tuple, Dict, Optional
 from data.preprocess import preprocess_mnist_classical
 
 # Import visualization utilities
+import sys
+import os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../')))
+
 try:
-    from viz_cFL import generate_all_cfl_visualizations
+    from visualizations.plot_cfl import generate_all_cfl_visualizations
     VISUALIZATIONS_AVAILABLE = True
 except ImportError:
     VISUALIZATIONS_AVAILABLE = False
 
-
-# ============================================================================
-# REPRODUCIBILITY
-# ============================================================================
 
 def set_seeds(seed: int = 42):
     """Comprehensive seeding for reproducibility."""
@@ -56,11 +51,7 @@ seed_worker = set_seeds(42)
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"🖥️  Device: {device}")
 
-
-# ============================================================================
 # MODEL ARCHITECTURE
-# ============================================================================
-
 class TinyCNN(nn.Module):
     """
     Lightweight CNN for MNIST with Batch Normalization.
@@ -81,15 +72,11 @@ class TinyCNN(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = F.max_pool2d(F.relu(self.bn1(self.conv1(x))), 2)
         x = F.max_pool2d(F.relu(self.bn2(self.conv2(x))), 2)
-        x = x.view(-1, 32 * 7 * 7)
+        x = x.flatten(1)
         x = self.dropout(F.relu(self.fc1(x)))
         return self.fc2(x)
 
-
-# ============================================================================
 # DATA VALIDATION
-# ============================================================================
-
 def verify_data_format(
     client_data: List[Tuple[torch.Tensor, torch.Tensor]], 
     expected_dim: int = 784, 
@@ -120,11 +107,7 @@ def verify_data_format(
     
     print("   ✅ All clients validated!\n")
 
-
-# ============================================================================
 # CLIENT TRAINING
-# ============================================================================
-
 class ClientTrainer:
     """
     Persistent client trainer with reusable DataLoader.
@@ -159,7 +142,6 @@ class ClientTrainer:
     ) -> Tuple[Dict[str, torch.Tensor], int, float]:
         """
         Perform local training.
-        
         Returns:
             (updated_params, num_samples, avg_training_loss)
         """
@@ -188,11 +170,7 @@ class ClientTrainer:
         
         return model.state_dict(), self.n_samples, np.mean(epoch_losses)
 
-
-# ============================================================================
 # FEDERATED AGGREGATION
-# ============================================================================
-
 def federated_averaging(
     client_updates: List[Tuple[Dict[str, torch.Tensor], int, float]], 
     global_params_template: Dict[str, torch.Tensor]
@@ -235,11 +213,7 @@ def federated_averaging(
     
     return aggregated, weighted_loss
 
-
-# ============================================================================
 # EVALUATION
-# ============================================================================
-
 def evaluate_model(
     model: nn.Module, 
     test_data: Tuple[torch.Tensor, torch.Tensor],
@@ -277,11 +251,7 @@ def evaluate_model(
     
     return correct / total, np.mean(losses)
 
-
-# ============================================================================
 # FEDERATED LEARNING LOOP
-# ============================================================================
-
 def federated_learning(
     client_data: List[Tuple[torch.Tensor, torch.Tensor]],
     val_data: Tuple[torch.Tensor, torch.Tensor],
@@ -557,11 +527,7 @@ def federated_learning(
     
     return metrics
 
-
-# ============================================================================
 # MAIN
-# ============================================================================
-
 def main():
     """Main entry point for classical federated learning."""
     config = {

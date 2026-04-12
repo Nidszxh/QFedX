@@ -15,11 +15,16 @@ from sklearn.decomposition import PCA, IncrementalPCA
 from sklearn.preprocessing import MinMaxScaler
 
 # Import visualization utilities
+import sys
+import os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../')))
+
 try:
-    from viz_preprocess import generate_all_preprocessing_visualizations
+    from visualizations.plot_preprocess import generate_all_preprocessing_visualizations
     VISUALIZATIONS_AVAILABLE = True
 except ImportError:
     VISUALIZATIONS_AVAILABLE = False
+    print("⚠️  Warning: visualizations.plot_preprocess module not found. Visualizations will be skipped.")
 
 """
 Dual-Mode MNIST Preprocessing for Federated Learning
@@ -75,6 +80,7 @@ def create_partition(y_data: np.ndarray, num_clients: int, alpha: Optional[float
     return (create_iid_partition(indices, num_clients, rng) if alpha is None 
             else create_non_iid_partition(y_data, num_clients, alpha, rng))
 
+
 # VALIDATION
 
 def validate_client_partitions(client_indices: List[np.ndarray], y_data: np.ndarray, num_classes: int, partition_type: str) -> None:
@@ -99,6 +105,7 @@ def validate_client_partitions(client_indices: List[np.ndarray], y_data: np.ndar
 def compute_data_hash(X: np.ndarray, y: np.ndarray) -> str:
     combined = np.concatenate([X.flatten(), y.flatten()])
     return hashlib.sha256(combined.tobytes()).hexdigest()
+
 
 # PCA
 
@@ -173,22 +180,22 @@ def save_client_data_parallel(client_data: List[Tuple[torch.Tensor, torch.Tensor
 # CORE PREPROCESSING (Internal)
 
 def _preprocess_mnist_core(
-    raw_folder: str,
-    processed_folder: str,
-    digits: Tuple[int, ...],
+    raw_folder: str, 
+    processed_folder: str, 
+    digits: Tuple[int, ...], 
     val_split: float,
-    num_clients: int,
-    partition_type: str,
-    alpha: Optional[float],
-    apply_pca: bool,
+    num_clients: int, 
+    partition_type: str, 
+    alpha: Optional[float], 
+    apply_pca: bool, 
     pca_components: Optional[int],
-    encoding_range: Tuple[float, float],
-    seed: int,
-    generate_plots: bool,
+    encoding_range: Tuple[float, float], 
+    seed: int, 
+    generate_plots: bool, 
     use_incremental_pca: bool,
-    pca_batch_size: Optional[int],
-    variance_threshold: float,
-    parallel_io: bool,
+    pca_batch_size: Optional[int], 
+    variance_threshold: float, 
+    parallel_io: bool, 
     model_type: str
 ) -> Tuple[Tuple, Tuple, Tuple, List[Tuple]]:
     
@@ -257,6 +264,9 @@ def _preprocess_mnist_core(
     y_train = y_train_filt[train_idx]
     X_val = X_train_filt[val_idx]
     y_val = y_train_filt[val_idx]
+    
+    # Keep original images for visualization
+    X_train_original = X_train.copy()
     
     print(f"   Training: {len(y_train):,} samples")
     print(f"   Validation: {len(y_val):,} samples")
@@ -422,7 +432,7 @@ def _preprocess_mnist_core(
     # Advanced visualizations
     if generate_plots and VISUALIZATIONS_AVAILABLE:
         try:
-            print("\n📊 Generating advanced visualizations...")
+            print("\n📊 Generating comprehensive visualizations...")
             generate_all_preprocessing_visualizations(
                 pca_model=pca_model if apply_pca else None,
                 data_before_scaling=data_before_scaling,
@@ -433,10 +443,15 @@ def _preprocess_mnist_core(
                 y_val=y_val,
                 metadata=metadata,
                 num_classes=len(digits),
-                save_dir=f"./results/preprocessing_{model_type}"
+                save_dir=f"./results/preprocessing_{model_type}",
+                X_train_original=X_train_original / 255.0  # Normalized original images
             )
         except Exception as e:
-            print(f"   ⚠️  Warning: Could not generate advanced visualizations: {e}")
+            print(f"   ⚠️  Warning: Could not generate visualizations: {e}")
+            import traceback
+            traceback.print_exc()
+    elif generate_plots and not VISUALIZATIONS_AVAILABLE:
+        print("\n   ⚠️  Visualization module not available. Skipping plots.")
     
     # Summary
     print("\n✅ Preprocessing Complete!")
@@ -569,7 +584,7 @@ if __name__ == "__main__":
         partition_type='iid',
         alpha=0.5,
         seed=42,
-        generate_plots=False
+        generate_plots=True
     )
     
     print(f"✅ Classical preprocessing complete!")
@@ -589,7 +604,7 @@ if __name__ == "__main__":
         alpha=0.5,
         pca_components=4,
         seed=42,
-        generate_plots=False
+        generate_plots=True
     )
     
     print(f"✅ Quantum preprocessing complete!")
@@ -600,4 +615,7 @@ if __name__ == "__main__":
     print(f"\nOutput directories:")
     print(f"   Classical: ./dataset/processed_classical/")
     print(f"   Quantum:   ./dataset/processed_quantum/")
+    print(f"\nVisualization directories:")
+    print(f"   Classical: ./results/preprocessing_classical/")
+    print(f"   Quantum:   ./results/preprocessing_quantum/")
     print()
