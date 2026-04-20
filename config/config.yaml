@@ -1,0 +1,71 @@
+hydra:
+  output_subdir: null
+  run:
+    dir: .
+
+seed: 42
+device: auto
+mode: qfl
+experiment_name: qfedx_run
+mlflow_tracking_uri: sqlite:///mlflow.db
+max_exp: 5
+
+# QNN hyperparameters
+n_qubits: 4
+n_layers: 2
+n_readout: null
+encoding: amplitude
+entanglement: circular
+n_features: 4
+n_classes: 3
+batch_size: 16
+epochs: 5
+classical_lr: 0.001
+quantum_lr: 0.0005
+weight_decay: 0.0001
+grad_clip: 1.0
+device_name: default.qubit
+diff_method: backprop
+shots: null
+optimizer_type: adamw
+spsa_a: 0.01
+spsa_c: 0.1
+wrap_angles: true
+
+# Noise
+noise_type: none
+depolarizing_p: 0.001
+amplitude_gamma: 0.001
+readout_flip_prob: 0.01
+
+# Federated Learning
+num_rounds: 5
+local_epochs: 3
+client_fraction: 0.75
+
+# Data
+raw_folder: ./dataset/raw
+processed_folder: ./dataset/processed
+digits: [0, 1, 2]
+val_split: 0.1
+num_clients: 4
+partition_type: iid
+alpha: 0.5
+apply_pca: true
+pca_components: 4
+generate_plots: false
+
+# Early stopping
+early_stop_patience: 0
+early_stop_delta: 0.0001
+
+# Checkpointing
+checkpoint_dir: ./checkpoints
+checkpoint_interval: 5
+
+# Privacy
+dp_enabled: false
+dp_clip_norm: 1.0
+dp_noise_multiplier: 1.0
+dp_delta: 1.0e-5
+secure_aggregation: false
